@@ -1,0 +1,553 @@
+package scan
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/0xdeafcafe/springclean/internal/catalog"
+	"github.com/0xdeafcafe/springclean/internal/domain"
+	"github.com/dustin/go-humanize"
+)
+
+type Event interface{ isEvent() }
+
+type SuspectEvent struct{ S domain.Suspect }
+type ProgressEvent struct{ P domain.ScanProgress }
+type ErrorEvent struct {
+	Path string
+	Err  error
+}
+type DoneEvent struct{ R domain.ScanResult }
+
+func (SuspectEvent) isEvent()  {}
+func (ProgressEvent) isEvent() {}
+func (ErrorEvent) isEvent()    {}
+func (DoneEvent) isEvent()     {}
+
+type Config struct {
+	Mode    domain.ScanMode
+	Root    string
+	Workers int
+	MinSize int64
+}
+
+type Scanner struct {
+	cfg Config
+
+	sem chan struct{}
+	wg  sync.WaitGroup
+
+	out chan<- Event
+	ctx context.Context
+
+	items         atomic.Int64
+	bytes         atomic.Int64
+	suspects      atomic.Int64
+	suspBytes     atomic.Int64
+	errCount      atomic.Int64
+	skipped       atomic.Int64
+	submitted     atomic.Int64
+	completed     atomic.Int64
+	activeWorkers atomic.Int64
+	peakWorkers   atomic.Int64
+
+	currentPath atomic.Value // string
+	started     time.Time
+
+	suspMu   sync.Mutex
+	suspList []domain.Suspect
+
+	seenMu sync.Mutex
+	seen   map[string]bool
+
+	skipSet map[string]bool
+	markers map[string]catalog.StopMarker
+}
+
+func New(cfg Config) *Scanner {
+	if cfg.Workers <= 0 {
+		// FS work is IO-bound — overcommit aggressively. APFS handles
+		// concurrent metadata reads well; the OS scheduler tames any excess.
+		cfg.Workers = runtime.NumCPU() * 16
+	}
+	if cfg.Workers < 32 {
+		cfg.Workers = 32
+	}
+	if cfg.Workers > 256 {
+		cfg.Workers = 256
+	}
+	if cfg.MinSize <= 0 {
+		cfg.MinSize = 1 * 1024 * 1024 // 1 MB
+	}
+	skipSet := map[string]bool{}
+	for _, p := range catalog.SkipDuringHomeWalk() {
+		skipSet[p] = true
+	}
+	return &Scanner{
+		cfg:     cfg,
+		sem:     make(chan struct{}, cfg.Workers),
+		seen:    map[string]bool{},
+		skipSet: skipSet,
+		markers: catalog.StopMarkers(),
+	}
+}
+
+func (s *Scanner) Run(ctx context.Context) <-chan Event {
+	out := make(chan Event, 256)
+	s.out = out
+	s.ctx = ctx
+	go s.run(ctx, out)
+	return out
+}
+
+func (s *Scanner) run(ctx context.Context, out chan<- Event) {
+	defer close(out)
+
+	s.started = time.Now()
+	s.currentPath.Store("")
+
+	// Progress ticker.
+	stopProg := make(chan struct{})
+	progDone := make(chan struct{})
+	go func() {
+		s.progressLoop(ctx, out, stopProg)
+		close(progDone)
+	}()
+
+	// Seed jobs based on mode.
+	switch s.cfg.Mode {
+	case domain.ModeCurated:
+		s.seedCurated()
+		s.detectUnusedApps()
+	case domain.ModeHome:
+		s.seedCurated()
+		s.detectUnusedApps()
+		if home, err := os.UserHomeDir(); err == nil {
+			s.walkRoot(home)
+		}
+	case domain.ModeRoot:
+		root := s.cfg.Root
+		if root == "" {
+			root = "/"
+		}
+		s.walkRoot(root)
+	}
+
+	// Wait for all work to finish.
+	s.wg.Wait()
+	close(stopProg)
+	<-progDone
+
+	finished := time.Now()
+
+	s.suspMu.Lock()
+	result := domain.ScanResult{
+		StartedAt:  s.started,
+		FinishedAt: finished,
+		Mode:       s.cfg.Mode,
+		Root:       s.cfg.Root,
+		Suspects:   append([]domain.Suspect(nil), s.suspList...),
+		Stats: domain.Stats{
+			TotalItems: s.items.Load(),
+			TotalBytes: s.bytes.Load(),
+			Skipped:    int(s.skipped.Load()),
+			Errors:     int(s.errCount.Load()),
+			Duration:   finished.Sub(s.started),
+		},
+	}
+	s.suspMu.Unlock()
+
+	select {
+	case out <- DoneEvent{R: result}:
+	case <-ctx.Done():
+	}
+}
+
+func (s *Scanner) progressLoop(ctx context.Context, out chan<- Event, stop <-chan struct{}) {
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			s.emitProgress(true)
+			return
+		case <-t.C:
+			s.emitProgress(false)
+		}
+	}
+}
+
+func (s *Scanner) emitProgress(done bool) {
+	cur, _ := s.currentPath.Load().(string)
+	submitted := s.submitted.Load()
+	completed := s.completed.Load()
+	active := s.activeWorkers.Load()
+	queued := submitted - completed - active
+	if queued < 0 {
+		queued = 0
+	}
+	elapsed := time.Since(s.started)
+	items := s.items.Load()
+	bytes := s.bytes.Load()
+	secs := elapsed.Seconds()
+	var ips, bps float64
+	if secs > 0 {
+		ips = float64(items) / secs
+		bps = float64(bytes) / secs
+	}
+	p := domain.ScanProgress{
+		Phase:           "scanning",
+		CurrentPath:     cur,
+		ItemsSeen:       items,
+		BytesSeen:       bytes,
+		SuspectCount:    int(s.suspects.Load()),
+		SuspectBytes:    s.suspBytes.Load(),
+		Errors:          int(s.errCount.Load()),
+		Skipped:         int(s.skipped.Load()),
+		Done:            done,
+		ActiveWorkers:   int(active),
+		Queued:          int(queued),
+		PeakWorkers:     int(s.peakWorkers.Load()),
+		GoroutinesSpawn: submitted,
+		Elapsed:         elapsed,
+		ItemsPerSec:     ips,
+		BytesPerSec:     bps,
+	}
+	select {
+	case s.out <- ProgressEvent{P: p}:
+	case <-s.ctx.Done():
+	}
+}
+
+func (s *Scanner) submit(fn func()) {
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.submitted.Add(1)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer s.completed.Add(1)
+		select {
+		case s.sem <- struct{}{}:
+		case <-s.ctx.Done():
+			return
+		}
+		defer func() { <-s.sem }()
+		active := s.activeWorkers.Add(1)
+		for {
+			peak := s.peakWorkers.Load()
+			if active <= peak || s.peakWorkers.CompareAndSwap(peak, active) {
+				break
+			}
+		}
+		defer s.activeWorkers.Add(-1)
+		fn()
+	}()
+}
+
+func (s *Scanner) markSeen(path string) bool {
+	s.seenMu.Lock()
+	defer s.seenMu.Unlock()
+	if s.seen[path] {
+		return false
+	}
+	s.seen[path] = true
+	return true
+}
+
+func (s *Scanner) emit(suspect domain.Suspect) {
+	if suspect.Size < s.cfg.MinSize {
+		return
+	}
+	s.suspMu.Lock()
+	s.suspList = append(s.suspList, suspect)
+	s.suspMu.Unlock()
+	s.suspects.Add(1)
+	s.suspBytes.Add(suspect.Size)
+	select {
+	case s.out <- SuspectEvent{S: suspect}:
+	case <-s.ctx.Done():
+	}
+}
+
+func (s *Scanner) reportErr(path string, err error) {
+	if errors.Is(err, fs.ErrPermission) {
+		s.skipped.Add(1)
+		return
+	}
+	s.errCount.Add(1)
+	select {
+	case s.out <- ErrorEvent{Path: path, Err: err}:
+	case <-s.ctx.Done():
+	}
+}
+
+func (s *Scanner) seedCurated() {
+	for _, loc := range catalog.KnownLocations() {
+		expanded := catalog.ExpandHome(loc.Path)
+		if loc.IsContents {
+			s.sizeContents(expanded, loc.Category, loc.Reason, loc.Regenerable)
+		} else {
+			s.sizeWhole(expanded, loc.Category, loc.Reason, loc.Regenerable)
+		}
+	}
+}
+
+func (s *Scanner) walkRoot(root string) {
+	s.walkDir(root)
+}
+
+func (s *Scanner) walkDir(dir string) {
+	s.submit(func() {
+		s.currentPath.Store(dir)
+		if ok, _ := linkedWorktree(dir); ok {
+			s.emitWorktree(dir)
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			s.reportErr(dir, err)
+			return
+		}
+		for _, e := range entries {
+			path := filepath.Join(dir, e.Name())
+			if s.skipSet[path] {
+				s.skipped.Add(1)
+				continue
+			}
+			s.items.Add(1)
+
+			if e.IsDir() {
+				if marker, ok := s.markers[e.Name()]; ok {
+					s.sizeWhole(path, marker.Category, marker.Reason, marker.Regenerable)
+					continue
+				}
+				if isHiddenSkip(e.Name()) {
+					continue
+				}
+				s.walkDir(path)
+				continue
+			}
+
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			sz := info.Size()
+			s.bytes.Add(sz)
+
+			s.checkFileHeuristics(path, info)
+		}
+	})
+}
+
+func (s *Scanner) checkFileHeuristics(path string, info fs.FileInfo) {
+	sz := info.Size()
+	parent := filepath.Dir(path)
+
+	if isInDownloads(parent) {
+		age := time.Since(info.ModTime())
+		if age > catalog.DownloadAgeDays*24*time.Hour && sz >= 10*1024*1024 {
+			days := int(age.Hours() / 24)
+			s.emit(domain.Suspect{
+				ID:          domain.MakeID(path),
+				Path:        path,
+				Size:        sz,
+				Category:    domain.CatDownload,
+				Reason:      fmt.Sprintf("Download untouched for %d days", days),
+				IsDir:       false,
+				LastUsed:    info.ModTime(),
+				Regenerable: false,
+			})
+			return
+		}
+	}
+
+	if sz >= catalog.LargeFileThreshold {
+		s.emit(domain.Suspect{
+			ID:          domain.MakeID(path),
+			Path:        path,
+			Size:        sz,
+			Category:    domain.CatLargeFile,
+			Reason:      fmt.Sprintf("Large file (%s)", humanize.Bytes(uint64(sz))),
+			IsDir:       false,
+			LastUsed:    info.ModTime(),
+			Regenerable: false,
+		})
+	}
+}
+
+func (s *Scanner) sizeWhole(path string, cat domain.Category, reason string, regen bool) {
+	s.submit(func() {
+		if !s.markSeen(path) {
+			return
+		}
+		s.currentPath.Store(path)
+		info, err := os.Lstat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				s.reportErr(path, err)
+			}
+			return
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		var size int64
+		if info.IsDir() {
+			size = s.sumDir(path)
+		} else {
+			size = info.Size()
+			s.bytes.Add(size)
+			s.items.Add(1)
+		}
+		s.emit(domain.Suspect{
+			ID:          domain.MakeID(path),
+			Path:        path,
+			Size:        size,
+			Category:    cat,
+			Reason:      reason,
+			IsDir:       info.IsDir(),
+			LastUsed:    info.ModTime(),
+			Regenerable: regen,
+		})
+	})
+}
+
+func (s *Scanner) sizeContents(path string, cat domain.Category, reason string, regen bool) {
+	s.submit(func() {
+		s.currentPath.Store(path)
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				s.reportErr(path, err)
+			}
+			return
+		}
+		for _, e := range entries {
+			child := filepath.Join(path, e.Name())
+			childReason := reason
+			if e.Name() != "" {
+				childReason = fmt.Sprintf("%s · %s", reason, e.Name())
+			}
+			s.sizeWhole(child, cat, childReason, regen)
+		}
+	})
+}
+
+// sumDir walks `root` in parallel and returns the total size of regular files
+// underneath. A local semaphore caps fan-out so this can't starve the global
+// worker pool that called us. Per-directory atomic batching keeps cache
+// contention low when many workers are active. Symlinks are not followed.
+func (s *Scanner) sumDir(root string) int64 {
+	var total atomic.Int64
+	localSem := make(chan struct{}, 16)
+	var wg sync.WaitGroup
+
+	var walk func(string)
+	walk = func(dir string) {
+		defer wg.Done()
+		select {
+		case localSem <- struct{}{}:
+		case <-s.ctx.Done():
+			return
+		}
+		defer func() { <-localSem }()
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if errors.Is(err, fs.ErrPermission) {
+				s.skipped.Add(1)
+			}
+			return
+		}
+		var localBytes int64
+		var localItems int64
+		for _, e := range entries {
+			p := filepath.Join(dir, e.Name())
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if e.IsDir() {
+				wg.Add(1)
+				go walk(p)
+				continue
+			}
+			localBytes += info.Size()
+			localItems++
+		}
+		if localBytes > 0 || localItems > 0 {
+			total.Add(localBytes)
+			s.bytes.Add(localBytes)
+			s.items.Add(localItems)
+		}
+	}
+	wg.Add(1)
+	walk(root)
+	wg.Wait()
+	return total.Load()
+}
+
+func isHiddenSkip(name string) bool {
+	switch name {
+	case ".git", ".hg", ".svn":
+		return true
+	}
+	return false
+}
+
+// emitWorktree records `dir` as a single suspect for a git linked worktree,
+// summing the working-tree size. Children are not walked separately — removing
+// the worktree reclaims everything inside, including its node_modules / target
+// / etc., so flagging them individually would double-count.
+func (s *Scanner) emitWorktree(dir string) {
+	if !s.markSeen(dir) {
+		return
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			s.reportErr(dir, err)
+		}
+		return
+	}
+	size := s.sumDir(dir)
+	mtime := info.ModTime()
+	reason := "Linked git worktree (uncommitted work may be lost)"
+	if age := time.Since(mtime); age > 30*24*time.Hour {
+		days := int(age.Hours() / 24)
+		reason = fmt.Sprintf("Linked git worktree, untouched for %d days (uncommitted work may be lost)", days)
+	}
+	s.emit(domain.Suspect{
+		ID:          domain.MakeID(dir),
+		Path:        dir,
+		Size:        size,
+		Category:    domain.CatGitWorktree,
+		Reason:      reason,
+		IsDir:       true,
+		LastUsed:    mtime,
+		Regenerable: false,
+	})
+}
+
+func isInDownloads(parent string) bool {
+	home, _ := os.UserHomeDir()
+	dl := filepath.Join(home, "Downloads")
+	return parent == dl || strings.HasPrefix(parent, dl+string(filepath.Separator))
+}
