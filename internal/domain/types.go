@@ -3,6 +3,8 @@ package domain
 import (
 	"crypto/sha256"
 	"encoding/base32"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -21,6 +23,7 @@ const (
 	CatLargeFile    Category = "large_file"
 	CatDuplicate    Category = "duplicate"
 	CatGitWorktree  Category = "git_worktree"
+	CatIgnoredCruft Category = "ignored_cruft"
 )
 
 func (c Category) Label() string {
@@ -49,6 +52,8 @@ func (c Category) Label() string {
 		return "Duplicate"
 	case CatGitWorktree:
 		return "Git worktree"
+	case CatIgnoredCruft:
+		return "Ignored cruft"
 	}
 	return string(c)
 }
@@ -79,6 +84,8 @@ func (c Category) Glyph() string {
 		return "✧"
 	case CatGitWorktree:
 		return "❂"
+	case CatIgnoredCruft:
+		return "❉"
 	}
 	return "•"
 }
@@ -87,7 +94,7 @@ func AllCategories() []Category {
 	return []Category{
 		CatDevCache, CatAppCache, CatAppLog, CatXcode, CatPkgCache,
 		CatDocker, CatTrash, CatDownload, CatUnusedApp, CatLargeFile, CatDuplicate,
-		CatGitWorktree,
+		CatGitWorktree, CatIgnoredCruft,
 	}
 }
 
@@ -133,6 +140,28 @@ type Suspect struct {
 	LastUsed    time.Time `yaml:"last_used,omitempty"`
 	Marked      bool      `yaml:"marked"`
 	Regenerable bool      `yaml:"regenerable"`
+
+	// Warning carries a per-item safety note, such as unsaved work that would be
+	// lost. Non-empty means the item needs a look before it's marked.
+	Warning string `yaml:"warning,omitempty"`
+
+	// GitDir is the `.git/worktrees/<name>` admin directory backing a
+	// CatGitWorktree suspect. Trashing the working tree leaves this behind, so
+	// apply uses it to prune the stale registration from the owning repo.
+	GitDir string `yaml:"git_dir,omitempty"`
+}
+
+// MainRepoFromGitDir maps a linked worktree's admin directory back to the
+// repository that owns it: `<repo>/.git/worktrees/<name>` → `<repo>`.
+// Returns "" when the path isn't shaped like a worktree admin dir.
+func MainRepoFromGitDir(gitDir string) string {
+	const sep = "/.git/worktrees/"
+	slashed := filepath.ToSlash(gitDir)
+	idx := strings.LastIndex(slashed, sep)
+	if idx < 0 {
+		return ""
+	}
+	return filepath.FromSlash(slashed[:idx])
 }
 
 func MakeID(path string) string {

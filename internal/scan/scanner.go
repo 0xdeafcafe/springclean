@@ -38,6 +38,20 @@ type Config struct {
 	Root    string
 	Workers int
 	MinSize int64
+
+	// WorktreeAgeDays is the minimum untouched age for a linked git worktree to
+	// be flagged. Zero uses catalog.WorktreeAgeDays; negative disables the
+	// filter and reports every worktree found.
+	WorktreeAgeDays int
+
+	// IgnoredAgeDays is the minimum untouched age for gitignored cruft.
+	// Zero uses catalog.IgnoredCruftAgeDays; negative disables the filter.
+	IgnoredAgeDays int
+
+	// ScanIgnored enables asking git for ignored-but-untracked paths in each
+	// repository the walk crosses. Off by default: it costs a `git ls-files`
+	// per repo, and the curated marker list already covers the common cases.
+	ScanIgnored bool
 }
 
 type Scanner struct {
@@ -68,6 +82,9 @@ type Scanner struct {
 
 	seenMu sync.Mutex
 	seen   map[string]bool
+
+	ignoredMu      sync.Mutex
+	ignoredScanned map[string]bool
 
 	skipSet map[string]bool
 	markers map[string]catalog.StopMarker
@@ -312,14 +329,22 @@ func (s *Scanner) walkRoot(root string) {
 func (s *Scanner) walkDir(dir string) {
 	s.submit(func() {
 		s.currentPath.Store(dir)
-		if ok, _ := linkedWorktree(dir); ok {
-			s.emitWorktree(dir)
-			return
+		if ok, gitDir := linkedWorktree(dir); ok {
+			if s.emitWorktree(dir, gitDir) {
+				// Emitted whole. Walking in would double-count everything
+				// the worktree removal already reclaims.
+				return
+			}
+			// Too recently touched to flag as abandoned. Fall through and walk
+			// it like any other directory so its caches are still found.
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			s.reportErr(dir, err)
 			return
+		}
+		if s.cfg.ScanIgnored && hasGitEntry(entries) {
+			s.scanIgnored(dir)
 		}
 		for _, e := range entries {
 			path := filepath.Join(dir, e.Name())
@@ -516,24 +541,46 @@ func isHiddenSkip(name string) bool {
 // summing the working-tree size. Children are not walked separately — removing
 // the worktree reclaims everything inside, including its node_modules / target
 // / etc., so flagging them individually would double-count.
-func (s *Scanner) emitWorktree(dir string) {
+//
+// Age comes from the newest real source file rather than the directory mtime,
+// and git is consulted for unsaved work, so a worktree the user is mid-way
+// through is never presented as abandoned.
+// Returns true when the worktree was emitted as a single suspect, false when
+// it was too recently touched and the caller should walk it normally.
+func (s *Scanner) emitWorktree(dir, gitDir string) bool {
 	if !s.markSeen(dir) {
-		return
+		return true
 	}
-	info, err := os.Lstat(dir)
-	if err != nil {
+	if _, err := os.Lstat(dir); err != nil {
 		if !os.IsNotExist(err) {
 			s.reportErr(dir, err)
 		}
-		return
+		return true
 	}
+
+	touched := contentModTime(s.ctx, dir)
+	if touched.IsZero() {
+		// Nothing datable inside, so fall back to the directory's own mtime
+		// rather than treating the worktree as infinitely old.
+		if info, err := os.Lstat(dir); err == nil {
+			touched = info.ModTime()
+		}
+	}
+
+	age := time.Since(touched)
+	if age < s.worktreeMinAge() {
+		return false
+	}
+
 	size := s.sumDir(dir)
-	mtime := info.ModTime()
-	reason := "Linked git worktree (uncommitted work may be lost)"
-	if age := time.Since(mtime); age > 30*24*time.Hour {
-		days := int(age.Hours() / 24)
-		reason = fmt.Sprintf("Linked git worktree, untouched for %d days (uncommitted work may be lost)", days)
+	git := readGitState(s.ctx, dir)
+	days := int(age.Hours() / 24)
+
+	reason := fmt.Sprintf("Linked git worktree, untouched for %d days", days)
+	if git.Branch != "" {
+		reason = fmt.Sprintf("%s (%s)", reason, git.Branch)
 	}
+
 	s.emit(domain.Suspect{
 		ID:          domain.MakeID(dir),
 		Path:        dir,
@@ -541,9 +588,26 @@ func (s *Scanner) emitWorktree(dir string) {
 		Category:    domain.CatGitWorktree,
 		Reason:      reason,
 		IsDir:       true,
-		LastUsed:    mtime,
+		LastUsed:    touched,
 		Regenerable: false,
+		Warning:     git.Warning(),
+		GitDir:      gitDir,
 	})
+	return true
+}
+
+// worktreeMinAge is how long a worktree must sit untouched before it's worth
+// showing. Zero from the config means "use the catalog default"; a negative
+// value disables the filter entirely.
+func (s *Scanner) worktreeMinAge() time.Duration {
+	switch {
+	case s.cfg.WorktreeAgeDays < 0:
+		return 0
+	case s.cfg.WorktreeAgeDays == 0:
+		return catalog.WorktreeAgeDays * 24 * time.Hour
+	default:
+		return time.Duration(s.cfg.WorktreeAgeDays) * 24 * time.Hour
+	}
 }
 
 func isInDownloads(parent string) bool {

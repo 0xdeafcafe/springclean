@@ -378,8 +378,14 @@ func (m Model) renderListRow(s domain.Suspect, selected bool, innerWidth int) st
 	}
 	glyph := lipgloss.NewStyle().Foreground(categoryColor(s.Category)).Render(s.Category.Glyph())
 	size := lipgloss.NewStyle().Foreground(theme.Sun).Bold(true).Render(humanize.Bytes(uint64(s.Size)))
-	pathStr := truncatePath(s.Path, innerWidth-22)
-	row := fmt.Sprintf("%s %s  %s  %s", mark, glyph, padRight(size, 9), pathStr)
+	// Unsaved work is the one thing worth seeing without opening the detail
+	// panel, so it gets a column of its own in the row.
+	risk := " "
+	if s.Warning != "" {
+		risk = theme.Danger.Render("⚠")
+	}
+	pathStr := truncatePath(s.Path, innerWidth-24)
+	row := fmt.Sprintf("%s %s %s  %s  %s", mark, risk, glyph, padRight(size, 9), pathStr)
 	if selected {
 		return theme.ListSelected.Width(innerWidth).Render(row)
 	}
@@ -432,7 +438,7 @@ func (m Model) renderDetailPanel() string {
 		)
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left,
+	rows := []string{
 		"",
 		lipgloss.NewStyle().Foreground(theme.Cream).Bold(true).Render(wrapped),
 		"",
@@ -443,7 +449,11 @@ func (m Model) renderDetailPanel() string {
 		field("Marked", mark, markStyle),
 		"",
 		theme.Dim.Render(s.Reason),
-	)
+	}
+	if s.Warning != "" {
+		rows = append(rows, theme.Danger.Render("⚠  "+s.Warning))
+	}
+	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
 	inner := lipgloss.JoinVertical(lipgloss.Left, header, body)
 	return theme.Panel.BorderForeground(theme.Lavender).Width(width).Height(height).Render(inner)
 }
@@ -712,6 +722,8 @@ func categoryColor(c domain.Category) lipgloss.Color {
 		return theme.Mist
 	case domain.CatGitWorktree:
 		return theme.Leaf
+	case domain.CatIgnoredCruft:
+		return theme.Soil
 	}
 	return theme.Cream
 }

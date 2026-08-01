@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/0xdeafcafe/springclean/internal/domain"
+	"github.com/0xdeafcafe/springclean/internal/gitwt"
 	"github.com/0xdeafcafe/springclean/internal/report"
 	"github.com/0xdeafcafe/springclean/internal/trash"
 	"github.com/dustin/go-humanize"
@@ -54,6 +56,7 @@ func newApplyCmd() *cobra.Command {
 			if len(res.Skipped) > 0 {
 				fmt.Fprintf(os.Stderr, "  %d items already gone\n", len(res.Skipped))
 			}
+			pruneWorktrees(r)
 			if len(res.Failed) > 0 {
 				fmt.Fprintf(os.Stderr, "  %d items failed:\n", len(res.Failed))
 				for p, e := range res.Failed {
@@ -63,6 +66,24 @@ func newApplyCmd() *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+// pruneWorktrees deregisters the worktrees we just trashed. Without this git
+// keeps listing them, so a `git worktree list` right after a clean-up still
+// shows every worktree that was removed.
+func pruneWorktrees(r report.Report) {
+	if noPruneFlag {
+		return
+	}
+	repos := gitwt.ReposToPrune(r.Suspects)
+	if len(repos) == 0 {
+		return
+	}
+	failed := gitwt.Prune(context.Background(), repos)
+	fmt.Fprintf(os.Stderr, "  pruned worktree registrations in %d repo(s)\n", len(repos)-len(failed))
+	for repo, err := range failed {
+		fmt.Fprintf(os.Stderr, "    - %s: prune failed: %v (run `git worktree prune` there)\n", repo, err)
 	}
 }
 
@@ -122,6 +143,27 @@ func printDryRun(r report.Report) {
 	}
 	fmt.Fprintln(os.Stderr, strings.Repeat("─", 50))
 	fmt.Fprintf(os.Stderr, "  total: %d items · %s\n", totalCount, humanize.Bytes(uint64(totalBytes)))
+	printWarnings(r)
+}
+
+// printWarnings calls out marked items holding work that only exists there.
+// This is the last point before the files move, so it goes after the totals
+// where it can't be scrolled past.
+func printWarnings(r report.Report) {
+	var warned []domain.Suspect
+	for _, s := range r.Suspects {
+		if s.Marked && s.Warning != "" {
+			warned = append(warned, s)
+		}
+	}
+	if len(warned) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "⚠  %d marked item(s) hold work that isn't saved anywhere else:\n", len(warned))
+	for _, s := range warned {
+		fmt.Fprintf(os.Stderr, "    - %s\n        %s\n", s.Path, s.Warning)
+	}
 }
 
 func isYes(s string) bool {

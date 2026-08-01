@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/0xdeafcafe/springclean/internal/catalog"
 	"github.com/0xdeafcafe/springclean/internal/domain"
 	"github.com/0xdeafcafe/springclean/internal/scan"
 	"github.com/0xdeafcafe/springclean/internal/tui"
@@ -17,6 +18,10 @@ var (
 	reportPathFlag string
 	yesFlag        bool
 	manualTrashFlag bool
+	worktreeAgeFlag int
+	ignoredAgeFlag  int
+	scanIgnoredFlag bool
+	noPruneFlag     bool
 )
 
 func newRootCmd() *cobra.Command {
@@ -42,6 +47,14 @@ func newRootCmd() *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&reportPathFlag, "report", "o", "springclean-report.yaml", "report file path")
 	cmd.PersistentFlags().BoolVarP(&yesFlag, "yes", "y", false, "skip confirmation prompts (apply)")
 	cmd.PersistentFlags().BoolVar(&manualTrashFlag, "manual-trash", false, "move to ~/.Trash directly (no Finder, no Put Back) — use when Automation is blocked")
+	cmd.PersistentFlags().IntVar(&worktreeAgeFlag, "worktree-age", catalog.WorktreeAgeDays,
+		"days a git worktree must sit untouched to be flagged (-1 to report all)")
+	cmd.PersistentFlags().IntVar(&ignoredAgeFlag, "ignored-age", catalog.IgnoredCruftAgeDays,
+		"days gitignored cruft must sit untouched to be flagged (-1 to report all)")
+	cmd.PersistentFlags().BoolVar(&scanIgnoredFlag, "ignored", false,
+		"ask git for large, stale gitignored files in every repo the scan crosses")
+	cmd.PersistentFlags().BoolVar(&noPruneFlag, "no-prune", false,
+		"skip `git worktree prune` after trashing worktrees")
 
 	cmd.AddCommand(newScanCmd())
 	cmd.AddCommand(newReviewCmd())
@@ -61,7 +74,12 @@ func scanConfigFromFlags() (scan.Config, error) {
 	if !ok {
 		return scan.Config{}, fmt.Errorf("invalid --scope %q (want curated|home|root)", scopeFlag)
 	}
-	cfg := scan.Config{Mode: mode}
+	cfg := scan.Config{
+		Mode:            mode,
+		WorktreeAgeDays: worktreeAgeFlag,
+		IgnoredAgeDays:  ignoredAgeFlag,
+		ScanIgnored:     scanIgnoredFlag,
+	}
 	if mode == domain.ModeRoot {
 		if rootFlag == "" {
 			cfg.Root = "/"

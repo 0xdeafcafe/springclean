@@ -174,3 +174,37 @@ const LargeFileThreshold int64 = 500 * 1024 * 1024 // 500 MB
 
 // UnusedAppThresholdDays is how long an app must be unopened to flag.
 const UnusedAppThresholdDays = 180
+
+// WorktreeAgeDays is how long a linked git worktree must sit untouched before
+// it's flagged. Age is measured from the newest source file inside it, not the
+// directory's own mtime. See scan.contentModTime.
+const WorktreeAgeDays = 14
+
+// IgnoredCruftAgeDays is how long a gitignored file or directory must sit
+// untouched before it's flagged.
+const IgnoredCruftAgeDays = 30
+
+// IgnoredCruftMinSize is the floor for flagging gitignored cruft. Well below
+// LargeFileThreshold, because the point is catching accumulated build output
+// and dumps that individually look small.
+const IgnoredCruftMinSize int64 = 50 * 1024 * 1024 // 50 MB
+
+// regenerableNames is derived once at init. Regenerable is called for every
+// directory entry during a walk, so it can't afford to rebuild the marker map.
+var regenerableNames = func() map[string]bool {
+	out := map[string]bool{}
+	for name, m := range StopMarkers() {
+		if m.Regenerable {
+			out[name] = true
+		}
+	}
+	return out
+}()
+
+// Regenerable reports whether a directory name is a known build/dependency
+// directory: content that a package manager or build step can recreate.
+// Such directories are excluded when dating a worktree, since reinstalling
+// dependencies shouldn't make abandoned work look freshly touched.
+func Regenerable(name string) bool {
+	return regenerableNames[name]
+}

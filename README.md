@@ -40,7 +40,8 @@ if you'd rather work from a yaml file:
 - **package cache** — npm, yarn, pnpm, pip, cargo, gradle, homebrew, go, bun, deno, maven, cocoapods
 - **app cache & logs** — `~/Library/Caches`, `~/Library/Logs`, vs code, slack, chrome, etc.
 - **xcode** — derived data, archives, ios/watchos/tvos device support, simulator caches
-- **git worktrees** — linked worktrees from `git worktree add`, with how long it's been since you last touched them
+- **git worktrees** — linked worktrees from `git worktree add` that nobody has touched in 14+ days, with a warning when one still holds uncommitted or unpushed work
+- **gitignored cruft** — big, stale, gitignored files and folders that no hardcoded name list would catch (opt in with `--ignored`)
 - **old downloads** — anything in `~/Downloads` you haven't touched in 90+ days
 - **large files** — anything >500MB lurking somewhere in `$HOME`
 - **unused apps** — `.app` bundles in `/Applications` you haven't opened in 180+ days (asks spotlight via `kMDItemLastUsedDate`)
@@ -53,6 +54,29 @@ three flavours:
 - `--scope=curated` (default) — just the known caches and unused apps. fast, safe, no surprises.
 - `--scope=home` — curated + walks your entire `$HOME` looking for `node_modules`, worktrees, big files, etc.
 - `--scope=root --root=/some/path` — walks anywhere you point it.
+
+worktrees, large files and gitignored cruft only turn up in the two walking scopes. curated never touches the filesystem beyond the known cache paths, so pointing it at a project and expecting worktrees won't work:
+
+```bash
+# find stale worktrees in one project
+./springclean --scope=root --root=~/Projects/myrepo
+```
+
+## git worktrees
+
+worktrees are found by their `.git` pointer file, so submodules and ordinary checkouts are left alone. a worktree is only flagged once it's sat untouched for `--worktree-age` days (14 by default; `-1` reports every one it finds).
+
+"untouched" means the newest source file inside it, not the directory's own mtime. that barely moves when you edit files, and gets bumped by things that aren't you. dependency and build directories don't count either, so an `npm install` won't make abandoned work look active.
+
+before anything gets trashed, springclean asks git whether the worktree still holds work that only exists there: uncommitted changes, unpushed commits, or a branch with no upstream at all. those show up with a `⚠` in the list and get spelled out again at the confirmation prompt. a worktree that's clean and fully pushed is safe to lose; one that isn't, isn't.
+
+trashing a worktree directory doesn't deregister it, and git goes on listing it as prunable, so apply runs `git worktree prune` in the owning repo afterwards. `--no-prune` skips that.
+
+## gitignored cruft
+
+`--ignored` asks git for everything it's been told to ignore in each repo the scan crosses, and flags whatever is both bigger than 50 MB and older than `--ignored-age` days (30 by default). this is the catch-all behind the curated name list: the data dumps, generated fixtures and stray archives that are specific to your project.
+
+directories holding checkouts are left alone. keeping worktrees somewhere gitignored is normal, and collapsing that into a single suspect would offer all of them for deletion at once, so those are walked through and judged individually instead.
 
 ## the move-to-trash bit
 
