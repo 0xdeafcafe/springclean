@@ -206,6 +206,49 @@ func contentModTime(ctx context.Context, root string) time.Time {
 	return newest
 }
 
+// project identifies the checkout a suspect was found inside, and when that
+// checkout was last worked on.
+type project struct {
+	root    string
+	touched time.Time
+}
+
+func (p project) known() bool { return p.root != "" && !p.touched.IsZero() }
+
+// gitActivity dates a checkout from git's own index.
+//
+// The index is rewritten by commit, checkout, add, rebase and even a bare
+// `git status`, which makes it a decent proxy for "somebody was working here"
+// at the cost of a single stat. contentModTime is the more accurate answer but
+// it walks the whole tree, which is far too expensive to do for every
+// repository a scan happens to cross.
+//
+// It errs towards looking recent, which is the safe direction: the cost is
+// leaving a stale cache on disk, not deleting one still in use.
+func gitActivity(dir string) time.Time {
+	gitPath := filepath.Join(dir, ".git")
+	info, err := os.Lstat(gitPath)
+	if err != nil {
+		return time.Time{}
+	}
+
+	indexPath := filepath.Join(gitPath, "index")
+	if !info.IsDir() {
+		// A linked worktree keeps its index in the admin directory.
+		ok, gitDir := linkedWorktree(dir)
+		if !ok {
+			return time.Time{}
+		}
+		indexPath = filepath.Join(gitDir, "index")
+	}
+	idx, err := os.Stat(indexPath)
+	if err != nil {
+		// No index yet. Fall back to whatever `.git` itself reports.
+		return info.ModTime()
+	}
+	return idx.ModTime()
+}
+
 // isNoiseFile matches files the OS and tooling rewrite on their own. They say
 // nothing about whether a human touched the worktree.
 func isNoiseFile(name string) bool {

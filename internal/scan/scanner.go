@@ -52,6 +52,11 @@ type Config struct {
 	// repository the walk crosses. Off by default: it costs a `git ls-files`
 	// per repo, and the curated marker list already covers the common cases.
 	ScanIgnored bool
+
+	// CacheAgeDays hides build and dependency directories belonging to a
+	// checkout somebody has worked on within this many days. Zero reports every
+	// cache found, which is the default.
+	CacheAgeDays int
 }
 
 type Scanner struct {
@@ -323,28 +328,42 @@ func (s *Scanner) seedCurated() {
 }
 
 func (s *Scanner) walkRoot(root string) {
-	s.walkDir(root)
+	s.walkDir(root, project{})
 }
 
-func (s *Scanner) walkDir(dir string) {
+// walkDir descends `dir`, carrying the checkout it is currently inside so that
+// anything found underneath can be attributed to it.
+func (s *Scanner) walkDir(dir string, proj project) {
 	s.submit(func() {
 		s.currentPath.Store(dir)
 		if ok, gitDir := linkedWorktree(dir); ok {
-			if s.emitWorktree(dir, gitDir) {
+			touched, emitted := s.emitWorktree(dir, gitDir)
+			if emitted {
 				// Emitted whole. Walking in would double-count everything
 				// the worktree removal already reclaims.
 				return
 			}
-			// Too recently touched to flag as abandoned. Fall through and walk
-			// it like any other directory so its caches are still found.
+			// Too recently touched to flag as abandoned. Walk it like any other
+			// directory so its caches are still found, but remember how fresh
+			// it is: its caches belong to work that's still in progress.
+			proj = project{root: dir, touched: touched}
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			s.reportErr(dir, err)
 			return
 		}
-		if s.cfg.ScanIgnored && hasGitEntry(entries) {
-			s.scanIgnored(dir)
+		if hasGitEntry(entries) {
+			if s.cfg.ScanIgnored {
+				s.scanIgnored(dir)
+			}
+			// An ordinary checkout. Dating it from git's index is a stat rather
+			// than the full walk emitWorktree can afford to do.
+			if proj.root != dir {
+				if touched := gitActivity(dir); !touched.IsZero() {
+					proj = project{root: dir, touched: touched}
+				}
+			}
 		}
 		for _, e := range entries {
 			path := filepath.Join(dir, e.Name())
@@ -356,13 +375,17 @@ func (s *Scanner) walkDir(dir string) {
 
 			if e.IsDir() {
 				if marker, ok := s.markers[e.Name()]; ok {
-					s.sizeWhole(path, marker.Category, marker.Reason, marker.Regenerable)
+					if s.cacheSuppressed(proj) {
+						s.skipped.Add(1)
+						continue
+					}
+					s.sizeCache(path, marker.Category, marker.Reason, marker.Regenerable, proj)
 					continue
 				}
 				if isHiddenSkip(e.Name()) {
 					continue
 				}
-				s.walkDir(path)
+				s.walkDir(path, proj)
 				continue
 			}
 
@@ -412,6 +435,61 @@ func (s *Scanner) checkFileHeuristics(path string, info fs.FileInfo) {
 			Regenerable: false,
 		})
 	}
+}
+
+// cacheSuppressed reports whether a cache should be left alone because the
+// project owning it is still being worked on.
+func (s *Scanner) cacheSuppressed(proj project) bool {
+	minAge := s.cacheMinAge()
+	if minAge <= 0 || !proj.known() {
+		return false
+	}
+	return time.Since(proj.touched) < minAge
+}
+
+// cacheMinAge is how long a project must have been left alone before its
+// caches are worth offering. Zero means no filter: every cache is reported,
+// which is the behaviour when the flag isn't set.
+func (s *Scanner) cacheMinAge() time.Duration {
+	if s.cfg.CacheAgeDays <= 0 {
+		return 0
+	}
+	return time.Duration(s.cfg.CacheAgeDays) * 24 * time.Hour
+}
+
+// sizeCache emits a build or dependency directory, tagged with the checkout it
+// belongs to.
+func (s *Scanner) sizeCache(path string, cat domain.Category, reason string, regen bool, proj project) {
+	s.submit(func() {
+		if !s.markSeen(path) {
+			return
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				s.reportErr(path, err)
+			}
+			return
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		sus := domain.Suspect{
+			ID:          domain.MakeID(path),
+			Path:        path,
+			Size:        s.sumDir(path),
+			Category:    cat,
+			Reason:      reason,
+			IsDir:       true,
+			LastUsed:    info.ModTime(),
+			Regenerable: regen,
+		}
+		if proj.known() {
+			sus.Project = proj.root
+			sus.ProjectLastUsed = proj.touched
+		}
+		s.emit(sus)
+	})
 }
 
 func (s *Scanner) sizeWhole(path string, cat domain.Category, reason string, regen bool) {
@@ -545,17 +623,18 @@ func isHiddenSkip(name string) bool {
 // Age comes from the newest real source file rather than the directory mtime,
 // and git is consulted for unsaved work, so a worktree the user is mid-way
 // through is never presented as abandoned.
-// Returns true when the worktree was emitted as a single suspect, false when
-// it was too recently touched and the caller should walk it normally.
-func (s *Scanner) emitWorktree(dir, gitDir string) bool {
+// Returns when the worktree was last worked on, and whether it was emitted as
+// a single suspect. A false second value means it was too recently touched to
+// be considered abandoned and the caller should walk it normally.
+func (s *Scanner) emitWorktree(dir, gitDir string) (time.Time, bool) {
 	if !s.markSeen(dir) {
-		return true
+		return time.Time{}, true
 	}
 	if _, err := os.Lstat(dir); err != nil {
 		if !os.IsNotExist(err) {
 			s.reportErr(dir, err)
 		}
-		return true
+		return time.Time{}, true
 	}
 
 	touched := contentModTime(s.ctx, dir)
@@ -569,7 +648,7 @@ func (s *Scanner) emitWorktree(dir, gitDir string) bool {
 
 	age := time.Since(touched)
 	if age < s.worktreeMinAge() {
-		return false
+		return touched, false
 	}
 
 	size := s.sumDir(dir)
@@ -593,7 +672,7 @@ func (s *Scanner) emitWorktree(dir, gitDir string) bool {
 		Warning:     git.Warning(),
 		GitDir:      gitDir,
 	})
-	return true
+	return touched, true
 }
 
 // worktreeMinAge is how long a worktree must sit untouched before it's worth

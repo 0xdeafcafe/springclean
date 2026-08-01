@@ -100,6 +100,8 @@ func (m Model) viewOptions() string {
 	row(fieldWorktreeAge, "stale worktrees", ageLabel(f.worktreeAge), "untouched for at least this long")
 	row(fieldIgnored, "gitignored cruft", onOff(f.ignored), "ask git for big, stale ignored files")
 	row(fieldIgnoredAge, "cruft age", ageLabel(f.ignoredAge), "how long ignored files must sit unused")
+	row(fieldCacheAge, "hide live caches", cacheAgeLabel(f.cacheAge),
+		"skip caches whose project is still being worked on")
 
 	heading := theme.PanelTitle.Render("scan options")
 	intro := theme.Subtitle.Render("worktrees and gitignored cruft need a walking scope")
@@ -161,6 +163,18 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// cacheAgeLabel reads as a filter rather than a threshold, because 0 here
+// means "show everything" rather than "no waiting period".
+func cacheAgeLabel(days int) string {
+	if days <= 0 {
+		return "off (show every cache)"
+	}
+	if days == 1 {
+		return "project idle 1+ day"
+	}
+	return "project idle " + itoa(days) + "+ days"
 }
 
 func (m Model) viewPermissionDenied() string {
@@ -549,7 +563,8 @@ func (m Model) renderDetailPanel() string {
 
 	lastUsed := "—"
 	if !s.LastUsed.IsZero() {
-		lastUsed = fmt.Sprintf("%s (%s ago)",
+		// humanize.Time already renders the "ago".
+		lastUsed = fmt.Sprintf("%s (%s)",
 			s.LastUsed.Format("2006-01-02"),
 			humanize.Time(s.LastUsed),
 		)
@@ -562,11 +577,25 @@ func (m Model) renderDetailPanel() string {
 		field("Category", s.Category.Glyph()+" "+s.Category.Label(), lipgloss.NewStyle().Foreground(categoryColor(s.Category))),
 		field("Size", humanize.Bytes(uint64(s.Size)), theme.Highlight),
 		field("Last used", lastUsed, theme.ListItem),
+	}
+	// A cache's own mtime says when it was installed. Whether the project
+	// around it is still live is the thing that decides if it should go.
+	if s.Project != "" && !s.ProjectLastUsed.IsZero() {
+		projStyle := theme.ListItem
+		if time.Since(s.ProjectLastUsed) < 7*24*time.Hour {
+			projStyle = lipgloss.NewStyle().Foreground(theme.Warning)
+		}
+		rows = append(rows,
+			field("Project", truncateHead(shortenHome(s.Project), 34), theme.ListItem),
+			field("Worked on", humanize.Time(s.ProjectLastUsed), projStyle),
+		)
+	}
+	rows = append(rows,
 		field("Regenerable", regen, regenStyle),
 		field("Marked", mark, markStyle),
 		"",
 		theme.Dim.Render(s.Reason),
-	}
+	)
 	if s.Warning != "" {
 		rows = append(rows, theme.Danger.Render("⚠  "+s.Warning))
 	}

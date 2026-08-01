@@ -24,6 +24,7 @@ var (
 	scanIgnoredFlag bool
 	noPruneFlag     bool
 	hereFlag        bool
+	cacheAgeFlag    int
 )
 
 func newRootCmd() *cobra.Command {
@@ -59,6 +60,8 @@ func newRootCmd() *cobra.Command {
 		"skip `git worktree prune` after trashing worktrees")
 	cmd.PersistentFlags().BoolVar(&hereFlag, "here", false,
 		"scan the current directory (shorthand for --scope=root --root=.)")
+	cmd.PersistentFlags().IntVar(&cacheAgeFlag, "cache-age", 0,
+		"hide build/dependency caches whose project was worked on in the last N days (0 shows all)")
 
 	cmd.AddCommand(newWorktreesCmd())
 	cmd.AddCommand(newScanCmd())
@@ -84,6 +87,7 @@ func scanConfigFromFlags() (scan.Config, error) {
 		WorktreeAgeDays: worktreeAgeFlag,
 		IgnoredAgeDays:  ignoredAgeFlag,
 		ScanIgnored:     scanIgnoredFlag,
+		CacheAgeDays:    cacheAgeFlag,
 	}
 
 	// --here is shorthand for pointing --scope=root at the working directory.

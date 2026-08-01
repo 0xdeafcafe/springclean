@@ -77,6 +77,18 @@ before anything gets trashed, springclean asks git whether the worktree still ho
 
 trashing a worktree directory doesn't deregister it, and git goes on listing it as prunable, so apply runs `git worktree prune` in the owning repo afterwards. `--no-prune` skips that.
 
+## caches and the project around them
+
+a `node_modules` tells you when it was last installed, which is not the same question as whether you still need it. one sitting under a branch you pushed this morning is holding up live work; the identical directory under a branch nobody has opened since spring is just bytes.
+
+so caches are tagged with the checkout they were found in, and when that checkout was last worked on. the details panel shows both, and `--cache-age` filters on it:
+
+```bash
+springclean --here --cache-age 7   # only caches whose project has been idle a week
+```
+
+worktrees are dated from their newest source file, which is exact. every other checkout is dated from git's index, which moves on commit, checkout, add, rebase and even a bare `git status`. that costs one stat instead of walking the tree, and it errs towards looking recently used, so the failure mode is leaving a stale cache on disk rather than offering up one you're still using.
+
 ## gitignored cruft
 
 `--ignored` asks git for everything it's been told to ignore in each repo the scan crosses, and flags whatever is both bigger than 50 MB and older than `--ignored-age` days (30 by default). this is the catch-all behind the curated name list: the data dumps, generated fixtures and stray archives that are specific to your project.

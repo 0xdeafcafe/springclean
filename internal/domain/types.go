@@ -149,6 +149,14 @@ type Suspect struct {
 	// CatGitWorktree suspect. Trashing the working tree leaves this behind, so
 	// apply uses it to prune the stale registration from the owning repo.
 	GitDir string `yaml:"git_dir,omitempty"`
+
+	// Project is the checkout this item was found inside, and ProjectLastUsed
+	// is when that checkout was last worked on. A cache belonging to a project
+	// somebody touched this morning is a very different proposition to the
+	// same cache under a branch nobody has opened since spring, and the cache's
+	// own mtime says only when it was last installed.
+	Project         string    `yaml:"project,omitempty"`
+	ProjectLastUsed time.Time `yaml:"project_last_used,omitempty"`
 }
 
 // MainRepoFromGitDir maps a linked worktree's admin directory back to the

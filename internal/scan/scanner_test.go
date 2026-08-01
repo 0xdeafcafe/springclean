@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -445,5 +446,122 @@ func TestIgnoredCruftDoesNotDoubleCountKnownMarkers(t *testing.T) {
 	}
 	if nmCount != 1 {
 		t.Errorf("node_modules reported %d times, want exactly 1", nmCount)
+	}
+}
+
+// TestCachesAreAttributedToTheirProject covers the gap that made the results
+// hard to act on: a node_modules under a worktree touched this morning was
+// presented identically to one under a branch nobody has opened in months.
+func TestCachesAreAttributedToTheirProject(t *testing.T) {
+	_, wt, parent := setupRepoWithWorktree(t, "active")
+
+	// Worked on today, so the worktree itself is not stale.
+	writeSized(t, filepath.Join(wt, "src", "today.go"), 32)
+	writeSized(t, filepath.Join(wt, "node_modules", "pkg", "blob.bin"), 2*1024*1024)
+
+	got := runScan(t, Config{Mode: domain.ModeRoot, Root: parent, MinSize: 1024})
+
+	var cache *domain.Suspect
+	for i, s := range got {
+		if filepath.Base(s.Path) == "node_modules" && strings.HasPrefix(s.Path, wt) {
+			cache = &got[i]
+		}
+	}
+	if cache == nil {
+		t.Fatal("the worktree's node_modules was not reported")
+	}
+	if cache.Project != wt {
+		t.Errorf("Project = %q, want %q", cache.Project, wt)
+	}
+	if cache.ProjectLastUsed.IsZero() {
+		t.Error("ProjectLastUsed should record when the worktree was last worked on")
+	}
+	if age := time.Since(cache.ProjectLastUsed); age > time.Hour {
+		t.Errorf("ProjectLastUsed is %v old, want ~0 for a worktree edited just now", age)
+	}
+}
+
+func TestCacheAgeFilterHidesLiveProjects(t *testing.T) {
+	_, wt, parent := setupRepoWithWorktree(t, "active")
+	writeSized(t, filepath.Join(wt, "src", "today.go"), 32)
+	writeSized(t, filepath.Join(wt, "node_modules", "pkg", "blob.bin"), 2*1024*1024)
+
+	countCaches := func(cfg Config) int {
+		n := 0
+		for _, s := range runScan(t, cfg) {
+			if s.Category == domain.CatDevCache && strings.HasPrefix(s.Path, wt) {
+				n++
+			}
+		}
+		return n
+	}
+
+	base := Config{Mode: domain.ModeRoot, Root: parent, MinSize: 1024}
+	if got := countCaches(base); got != 1 {
+		t.Errorf("with the filter off, want the cache reported, got %d", got)
+	}
+
+	// The project was touched seconds ago, so a 7-day idle requirement hides it.
+	filtered := base
+	filtered.CacheAgeDays = 7
+	if got := countCaches(filtered); got != 0 {
+		t.Errorf("want the live project's cache hidden, got %d", got)
+	}
+}
+
+func TestCacheAgeFilterKeepsIdleProjects(t *testing.T) {
+	repo, wt, parent := setupRepoWithWorktree(t, "idle")
+	_ = repo
+
+	src := filepath.Join(wt, "src", "old.go")
+	writeSized(t, src, 32)
+	ageFile(t, src, 60*24*time.Hour)
+	ageFile(t, filepath.Join(wt, "a.txt"), 60*24*time.Hour)
+	writeSized(t, filepath.Join(wt, "node_modules", "pkg", "blob.bin"), 2*1024*1024)
+
+	cfg := Config{Mode: domain.ModeRoot, Root: parent, MinSize: 1024, CacheAgeDays: 7}
+	// The worktree is stale, so it is emitted whole and its cache is folded in
+	// rather than listed separately. Either way the bytes stay reclaimable.
+	var wtCount, cacheCount int
+	for _, s := range runScan(t, cfg) {
+		switch {
+		case s.Category == domain.CatGitWorktree && s.Path == wt:
+			wtCount++
+		case s.Category == domain.CatDevCache && strings.HasPrefix(s.Path, wt):
+			cacheCount++
+		}
+	}
+	if wtCount+cacheCount == 0 {
+		t.Error("an abandoned worktree's contents must stay reclaimable under the cache filter")
+	}
+}
+
+func TestGitActivityReadsTheIndex(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	git(t, dir, "init", "-q", "-b", "main")
+	writeSized(t, filepath.Join(dir, "a.txt"), 16)
+	git(t, dir, "add", "a.txt")
+	git(t, dir, "commit", "-qm", "first")
+
+	got := gitActivity(dir)
+	if got.IsZero() {
+		t.Fatal("gitActivity found nothing for a real repo")
+	}
+	if age := time.Since(got); age > time.Hour {
+		t.Errorf("gitActivity = %v old, want ~0 for a repo just committed to", age)
+	}
+
+	// A linked worktree keeps its index elsewhere; it must still be found.
+	wt := filepath.Join(t.TempDir(), "feature")
+	git(t, dir, "worktree", "add", "-q", "-b", "feature", wt)
+	if got := gitActivity(wt); got.IsZero() {
+		t.Error("gitActivity did not find a linked worktree's index")
+	}
+
+	if got := gitActivity(t.TempDir()); !got.IsZero() {
+		t.Error("gitActivity should report nothing for a directory that is not a checkout")
 	}
 }

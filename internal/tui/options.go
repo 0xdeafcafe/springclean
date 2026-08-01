@@ -59,6 +59,7 @@ const (
 	fieldWorktreeAge
 	fieldIgnored
 	fieldIgnoredAge
+	fieldCacheAge
 	fieldCount
 )
 
@@ -68,6 +69,7 @@ type optionsForm struct {
 	worktreeAge int
 	ignored     bool
 	ignoredAge  int
+	cacheAge    int
 
 	cursor  formField
 	editing bool // typing into the path field
@@ -78,6 +80,7 @@ func newOptionsForm(cfg scan.Config) optionsForm {
 		worktreeAge: cfg.WorktreeAgeDays,
 		ignored:     cfg.ScanIgnored,
 		ignoredAge:  cfg.IgnoredAgeDays,
+		cacheAge:    cfg.CacheAgeDays,
 	}
 	if f.worktreeAge == 0 {
 		f.worktreeAge = catalog.WorktreeAgeDays
@@ -128,6 +131,8 @@ func (f optionsForm) visible(field formField) bool {
 		return f.scope != scopeCurated
 	case fieldIgnoredAge:
 		return f.scope != scopeCurated && f.ignored
+	case fieldCacheAge:
+		return f.scope != scopeCurated
 	}
 	return true
 }
@@ -174,6 +179,15 @@ func (f *optionsForm) adjust(delta int) {
 		f.ignored = !f.ignored
 	case fieldIgnoredAge:
 		f.ignoredAge = stepAge(f.ignoredAge, delta)
+	case fieldCacheAge:
+		// 0 is meaningful here: it means every cache is reported.
+		f.cacheAge += delta
+		if f.cacheAge < 0 {
+			f.cacheAge = 0
+		}
+		if f.cacheAge > 3650 {
+			f.cacheAge = 3650
+		}
 	}
 }
 
@@ -248,12 +262,14 @@ func (f optionsForm) config() (scan.Config, error) {
 		WorktreeAgeDays: f.worktreeAge,
 		IgnoredAgeDays:  f.ignoredAge,
 		ScanIgnored:     f.ignored,
+		CacheAgeDays:    f.cacheAge,
 	}
 	switch f.scope {
 	case scopeCurated:
 		cfg.Mode = domain.ModeCurated
 		// Category-specific options don't apply without a walk.
 		cfg.ScanIgnored = false
+		cfg.CacheAgeDays = 0
 	case scopeHome:
 		cfg.Mode = domain.ModeHome
 	case scopeHere, scopeCustom:
