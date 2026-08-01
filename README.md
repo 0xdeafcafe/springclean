@@ -26,6 +26,8 @@ go build -o springclean .
 
 opens a tui. shows everything it found grouped by category. mark items, hit apply, watch the bytes-reclaimed counter tick up. it's quite satisfying.
 
+`←/→` move between the category tabs, and only the tabs that actually have something in them. `/` is a regex search over paths, reasons and project names, smartcase like vim: `node` matches anything, `Node` only the capitalised. it narrows whichever tab you're on, `esc` clears it. `o` opens the scan options.
+
 if you'd rather work from a yaml file:
 
 ```bash

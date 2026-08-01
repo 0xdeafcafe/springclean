@@ -449,13 +449,8 @@ func (m Model) renderCategoryChips() string {
 		counts[""]++
 		bytesBy[""] += s.Size
 	}
-	cats := []domain.Category{""}
-	for _, c := range domain.AllCategories() {
-		if counts[c] > 0 {
-			cats = append(cats, c)
-		}
-	}
 	var chips []string
+	cats := m.visibleCategories()
 	for _, c := range cats {
 		label := "All"
 		glyph := "✦"
@@ -473,15 +468,58 @@ func (m Model) renderCategoryChips() string {
 	return strings.Join(chips, theme.Dim.Render(" "))
 }
 
+// renderSearchLine draws the `/` prompt, or a reminder of the query that's
+// narrowing the list. Returns "" when no search is in play.
+func (m Model) renderSearchLine(width int) string {
+	if !m.search.active && !m.search.on() {
+		return ""
+	}
+	style := lipgloss.NewStyle().Foreground(theme.Sun)
+	if m.search.invalid {
+		style = theme.Danger
+	}
+	q := truncateHead(m.search.query, max(10, width-14))
+	line := style.Render("/" + q)
+	if m.search.active {
+		line += style.Render("▏")
+	}
+	switch {
+	case m.search.invalid:
+		line += theme.Danger.Render("  invalid regex")
+	case !m.search.active:
+		line += theme.Dim.Render("  [esc] clear")
+	}
+	return "  " + line
+}
+
+// emptyListMessage explains why nothing is showing, which is otherwise a
+// puzzle when a filter or a search is responsible.
+func (m Model) emptyListMessage() string {
+	switch {
+	case m.search.invalid:
+		return "that pattern doesn't compile"
+	case m.search.on() && m.filter != "":
+		return "nothing in " + m.filter.Label() + " matches /" + m.search.query
+	case m.search.on():
+		return "nothing matches /" + m.search.query
+	case len(m.suspects) > 0 && m.filter != "":
+		return "nothing in " + m.filter.Label()
+	}
+	return "no suspects yet… 🌱"
+}
+
 func (m Model) renderListPanel() string {
 	width := m.listWidth()
 	height := m.listHeight()
 
 	title := fmt.Sprintf("Suspects  (%d / %d shown)", len(m.view), len(m.suspects))
 	header := theme.PanelTitle.Render(title)
+	if line := m.renderSearchLine(width - 4); line != "" {
+		header = lipgloss.JoinVertical(lipgloss.Left, header, line)
+	}
 
 	if len(m.view) == 0 {
-		body := theme.Dim.Render("  no suspects yet… 🌱")
+		body := theme.Dim.Render("  " + m.emptyListMessage())
 		inner := lipgloss.JoinVertical(lipgloss.Left, header, body)
 		return theme.Panel.Width(width).Height(height).Render(inner)
 	}
@@ -667,11 +705,21 @@ func (m Model) phaseBanner() string {
 }
 
 func (m Model) renderFooter(scanning bool) string {
+	// While typing a search, the only keys that do anything are the editing
+	// ones, so showing the list bindings would be a lie.
+	if m.search.active {
+		return theme.KeyHint.Render("type a regex") +
+			theme.Dim.Render(" · ") + theme.KeyHint.Render("enter") + theme.Dim.Render(" keep") +
+			theme.Dim.Render(" · ") + theme.KeyHint.Render("esc") + theme.Dim.Render(" cancel") +
+			theme.Dim.Render(" · ") + theme.KeyHint.Render("ctrl+u") + theme.Dim.Render(" clear")
+	}
+
 	var hints []string
 	if scanning {
 		hints = []string{
 			theme.KeyHint.Render("space") + theme.Dim.Render(" mark"),
-			theme.KeyHint.Render("/") + theme.Dim.Render(" filter"),
+			theme.KeyHint.Render("←/→") + theme.Dim.Render(" tabs"),
+			theme.KeyHint.Render("/") + theme.Dim.Render(" search"),
 			theme.KeyHint.Render("s") + theme.Dim.Render(" sort"),
 			theme.KeyHint.Render("esc") + theme.Dim.Render(" cancel scan"),
 			theme.KeyHint.Render("q") + theme.Dim.Render(" quit"),
@@ -680,10 +728,11 @@ func (m Model) renderFooter(scanning bool) string {
 		hints = []string{
 			theme.KeyHint.Render("space") + theme.Dim.Render(" mark"),
 			theme.KeyHint.Render("S") + theme.Dim.Render(" mark safe"),
-			theme.KeyHint.Render("/") + theme.Dim.Render(" filter"),
+			theme.KeyHint.Render("←/→") + theme.Dim.Render(" tabs"),
+			theme.KeyHint.Render("/") + theme.Dim.Render(" search"),
 			theme.KeyHint.Render("s") + theme.Dim.Render(" sort"),
+			theme.KeyHint.Render("o") + theme.Dim.Render(" options"),
 			theme.KeyHint.Render("R") + theme.Dim.Render(" save report"),
-			theme.KeyHint.Render("e") + theme.Dim.Render(" edit"),
 			theme.KeyHint.Render("r") + theme.Dim.Render(" rescan"),
 			theme.KeyHint.Render("D") + theme.Dim.Render(" trash marked"),
 			theme.KeyHint.Render("q") + theme.Dim.Render(" quit"),

@@ -73,10 +73,10 @@ func (s sortMode) Label() string {
 }
 
 type Options struct {
-	ScanConfig    scan.Config
+	ScanConfig      scan.Config
 	StartFromReport *report.Report // if non-nil, skip scan and show this report
-	SkipSplash    bool
-	ReportPath    string // path to save reports to / load from
+	SkipSplash      bool
+	ReportPath      string // path to save reports to / load from
 	// InitialFilter pre-selects a category so a targeted invocation lands on
 	// its answer rather than on everything the scan happened to find.
 	InitialFilter domain.Category
@@ -122,7 +122,8 @@ type Model struct {
 	flashAt  time.Time
 	err      string
 
-	form optionsForm
+	form   optionsForm
+	search search
 }
 
 func New(opts Options) Model {
@@ -464,9 +465,25 @@ func (m Model) beginFromOptions() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While the search line has focus every printable key is text, so this has
+	// to run before any of the single-letter list bindings.
+	if m.search.active {
+		return m.onSearchKey(msg)
+	}
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
+	case key.Matches(msg, m.keys.Search):
+		m.search.begin()
+		return m, nil
+	case msg.String() == "esc":
+		if m.search.on() {
+			m.search.clear()
+			m.selected, m.listTop = 0, 0
+			m.rebuildView()
+			m.setFlash("search cleared")
+		}
+		return m, nil
 	case key.Matches(msg, m.keys.Up):
 		m.moveSelection(-1)
 	case key.Matches(msg, m.keys.Down):
@@ -508,8 +525,6 @@ func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cycleFilter(1)
 	case key.Matches(msg, m.keys.PrevCat):
 		m.cycleFilter(-1)
-	case key.Matches(msg, m.keys.Filter):
-		m.cycleFilter(1)
 	case key.Matches(msg, m.keys.Sort):
 		m.sort = (m.sort + 1) % 4
 		m.rebuildView()
@@ -645,6 +660,9 @@ func (m *Model) rebuildView() {
 		if m.filter != "" && s.Category != m.filter {
 			continue
 		}
+		if m.search.on() && !m.search.matches(s) {
+			continue
+		}
 		m.view = append(m.view, i)
 	}
 	sort.Slice(m.view, func(a, b int) bool {
@@ -720,8 +738,60 @@ func (m *Model) toggleSelected() {
 	m.suspects[idx].Marked = !m.suspects[idx].Marked
 }
 
+// onSearchKey handles keystrokes while the `/` line has focus. The list
+// re-filters on every character, so the result is visible as it's typed.
+func (m Model) onSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		m.search.accept()
+		if m.search.invalid {
+			m.setFlash("invalid pattern")
+		}
+		return m, nil
+	case tea.KeyEsc:
+		m.search.cancel()
+	case tea.KeyBackspace:
+		m.search.backspace()
+	case tea.KeyCtrlU:
+		m.search.query = ""
+		m.search.compile()
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeySpace:
+		m.search.typeRune(" ")
+	case tea.KeyRunes:
+		m.search.typeRune(string(msg.Runes))
+	default:
+		return m, nil
+	}
+	m.selected, m.listTop = 0, 0
+	m.rebuildView()
+	return m, nil
+}
+
+// visibleCategories returns the tabs actually on screen: "all", then only the
+// categories the scan found something in. The chips and the keys that move
+// between them have to agree on this list, or the tabs step through categories
+// that aren't shown and land on an empty list.
+func (m Model) visibleCategories() []domain.Category {
+	counts := map[domain.Category]int{}
+	for _, s := range m.suspects {
+		counts[s.Category]++
+	}
+	cats := []domain.Category{""}
+	for _, c := range domain.AllCategories() {
+		if counts[c] > 0 {
+			cats = append(cats, c)
+		}
+	}
+	return cats
+}
+
 func (m *Model) cycleFilter(dir int) {
-	cats := append([]domain.Category{""}, domain.AllCategories()...)
+	cats := m.visibleCategories()
+	if len(cats) == 0 {
+		return
+	}
 	cur := 0
 	for i, c := range cats {
 		if c == m.filter {
@@ -770,4 +840,3 @@ func (m Model) markedPaths() []string {
 	}
 	return out
 }
-
