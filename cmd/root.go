@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/0xdeafcafe/springclean/internal/catalog"
 	"github.com/0xdeafcafe/springclean/internal/domain"
@@ -22,6 +23,7 @@ var (
 	ignoredAgeFlag  int
 	scanIgnoredFlag bool
 	noPruneFlag     bool
+	hereFlag        bool
 )
 
 func newRootCmd() *cobra.Command {
@@ -55,7 +57,10 @@ func newRootCmd() *cobra.Command {
 		"ask git for large, stale gitignored files in every repo the scan crosses")
 	cmd.PersistentFlags().BoolVar(&noPruneFlag, "no-prune", false,
 		"skip `git worktree prune` after trashing worktrees")
+	cmd.PersistentFlags().BoolVar(&hereFlag, "here", false,
+		"scan the current directory (shorthand for --scope=root --root=.)")
 
+	cmd.AddCommand(newWorktreesCmd())
 	cmd.AddCommand(newScanCmd())
 	cmd.AddCommand(newReviewCmd())
 	cmd.AddCommand(newApplyCmd())
@@ -80,14 +85,54 @@ func scanConfigFromFlags() (scan.Config, error) {
 		IgnoredAgeDays:  ignoredAgeFlag,
 		ScanIgnored:     scanIgnoredFlag,
 	}
-	if mode == domain.ModeRoot {
-		if rootFlag == "" {
-			cfg.Root = "/"
-		} else {
-			cfg.Root = rootFlag
+
+	// --here is shorthand for pointing --scope=root at the working directory.
+	if hereFlag && rootFlag == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return scan.Config{}, fmt.Errorf("cannot resolve the working directory: %w", err)
 		}
+		cfg.Mode = domain.ModeRoot
+		rootFlag = cwd
+	} else if hereFlag {
+		cfg.Mode = domain.ModeRoot
+	}
+
+	if cfg.Mode == domain.ModeRoot {
+		root, err := resolveRoot(rootFlag)
+		if err != nil {
+			return scan.Config{}, err
+		}
+		cfg.Root = root
 	}
 	return cfg, nil
+}
+
+// resolveRoot turns whatever the user typed into a directory that exists.
+//
+// A leading `~` is expanded here because the shell won't: in both bash and zsh
+// `--root=~/code` passes the tilde through literally, and a scan of a path
+// that doesn't exist used to succeed while quietly reporting nothing at all.
+func resolveRoot(p string) (string, error) {
+	if p == "" {
+		return "/", nil
+	}
+	p = catalog.ExpandHome(p)
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve --root %q: %w", p, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("--root %q does not exist", abs)
+		}
+		return "", fmt.Errorf("cannot read --root %q: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("--root %q is not a directory", abs)
+	}
+	return abs, nil
 }
 
 func runTUI(opts tui.Options) error {

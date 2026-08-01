@@ -21,6 +21,7 @@ type keymap struct {
 	Save      key.Binding
 	Edit      key.Binding
 	Rescan    key.Binding
+	Options   key.Binding
 	Help      key.Binding
 	Quit      key.Binding
 	Confirm   key.Binding
@@ -48,6 +49,7 @@ func newKeymap() keymap {
 		Save:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "save report")),
 		Edit:      key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit report in $EDITOR")),
 		Rescan:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "re-scan")),
+		Options:   key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "scan options")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 		Confirm:   key.NewBinding(key.WithKeys("y", "Y", "enter"), key.WithHelp("y/enter", "confirm")),

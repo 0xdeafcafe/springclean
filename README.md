@@ -55,11 +55,16 @@ three flavours:
 - `--scope=home` — curated + walks your entire `$HOME` looking for `node_modules`, worktrees, big files, etc.
 - `--scope=root --root=/some/path` — walks anywhere you point it.
 
-worktrees, large files and gitignored cruft only turn up in the two walking scopes. curated never touches the filesystem beyond the known cache paths, so pointing it at a project and expecting worktrees won't work:
+worktrees, large files and gitignored cruft only turn up in the two walking scopes. curated never touches the filesystem beyond the known cache paths, so pointing it at a project and expecting worktrees won't work.
+
+you don't have to remember any of that. press `[o]` on the splash screen for the scan options: scope, which folder, how stale a worktree has to be, whether to ask git about ignored files. `[o]` again from the results re-runs with different settings.
+
+from the shell there are shorter forms than spelling out the scope:
 
 ```bash
-# find stale worktrees in one project
-./springclean --scope=root --root=~/Projects/myrepo
+springclean --here              # scan the directory you're standing in
+springclean worktrees           # same, and open on the worktree category
+springclean worktrees ~/code    # or point it somewhere
 ```
 
 ## git worktrees

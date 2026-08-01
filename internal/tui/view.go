@@ -28,6 +28,8 @@ func (m Model) View() string {
 	switch m.phase {
 	case PhaseSplash:
 		return m.viewSplash()
+	case PhaseOptions:
+		return m.viewOptions()
 	case PhaseFDA:
 		return m.viewFDA()
 	case PhaseScanning:
@@ -44,6 +46,121 @@ func (m Model) View() string {
 		return m.viewCelebration()
 	}
 	return ""
+}
+
+func (m Model) viewOptions() string {
+	f := m.form
+
+	panelWidth := min(84, m.width-4)
+	// Border, padding and the two-column label gutter come off the top before
+	// anything is allowed to occupy a line.
+	const labelWidth = 18
+	inner := panelWidth - 8
+	valueWidth := inner - labelWidth - 2
+	if valueWidth < 12 {
+		valueWidth = 12
+	}
+
+	var body []string
+	row := func(field formField, label, value, note string) {
+		if !f.visible(field) {
+			return
+		}
+		cursor := "  "
+		labelStyle := theme.Dim
+		valueStyle := lipgloss.NewStyle().Foreground(theme.Cream)
+		if f.cursor == field {
+			cursor = lipgloss.NewStyle().Foreground(theme.Sun).Render("▸ ")
+			labelStyle = lipgloss.NewStyle().Foreground(theme.Sun)
+			valueStyle = lipgloss.NewStyle().Foreground(theme.Sun).Bold(true)
+		}
+		body = append(body, cursor+labelStyle.Render(padRight(label, labelWidth))+
+			valueStyle.Render(truncateMiddle(value, valueWidth)))
+		// The explanation belongs to whichever row is selected. Showing every
+		// one at once overflowed the panel and wrapped into the border.
+		if f.cursor == field && note != "" {
+			body = append(body, theme.Dim.Render(strings.Repeat(" ", labelWidth+2)+
+				truncateMiddle(note, valueWidth)))
+		}
+	}
+
+	// The tail of a path identifies it; truncatePath collapses the middle so
+	// aggressively that two sibling directories look identical here.
+	pathValue := truncateHead(shortenHome(f.path), valueWidth)
+	if f.cursor == fieldPath && f.editing {
+		pathValue = truncateHead(shortenHome(f.path), valueWidth-1) + "▏"
+	}
+	pathNote := "[e] to edit, [enter] to accept"
+	if f.editing {
+		pathNote = "typing… [enter] done · [ctrl+u] clear"
+	}
+
+	row(fieldScope, "scope", f.scope.Label(), f.scope.Blurb())
+	row(fieldPath, "path", pathValue, pathNote)
+	row(fieldWorktreeAge, "stale worktrees", ageLabel(f.worktreeAge), "untouched for at least this long")
+	row(fieldIgnored, "gitignored cruft", onOff(f.ignored), "ask git for big, stale ignored files")
+	row(fieldIgnoredAge, "cruft age", ageLabel(f.ignoredAge), "how long ignored files must sit unused")
+
+	heading := theme.PanelTitle.Render("scan options")
+	intro := theme.Subtitle.Render("worktrees and gitignored cruft need a walking scope")
+
+	hint := theme.KeyHint.Render("[↑↓] field · [←→] change · [space] scan · [esc] back")
+
+	parts := []string{heading, "", intro, ""}
+	parts = append(parts, body...)
+	if m.err != "" {
+		parts = append(parts, "", theme.Danger.Render(truncateMiddle("⚠  "+m.err, inner)))
+	}
+	parts = append(parts, "", hint)
+
+	panel := theme.Panel.BorderForeground(theme.Lavender).
+		Width(panelWidth).
+		Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+// truncateMiddle shortens plain text to fit, keeping both ends readable.
+func truncateMiddle(s string, max int) string {
+	r := []rune(s)
+	if max < 6 {
+		max = 6
+	}
+	if len(r) <= max {
+		return s
+	}
+	keep := max - 1
+	head := keep / 2
+	tail := keep - head
+	return string(r[:head]) + "…" + string(r[len(r)-tail:])
+}
+
+// shortenHome swaps the home directory prefix for `~`.
+func shortenHome(p string) string {
+	home, err := homeDir()
+	if err == nil && home != "" && strings.HasPrefix(p, home) {
+		return "~" + p[len(home):]
+	}
+	return p
+}
+
+// truncateHead keeps the tail of a string, which is what matters while the
+// user is typing a path.
+func truncateHead(s string, max int) string {
+	r := []rune(s)
+	if max < 4 {
+		max = 4
+	}
+	if len(r) <= max {
+		return s
+	}
+	return "…" + string(r[len(r)-(max-1):])
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 func (m Model) viewPermissionDenied() string {

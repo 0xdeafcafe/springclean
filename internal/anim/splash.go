@@ -84,7 +84,7 @@ func RenderSplash(tick, width int) string {
 
 	subtitle := theme.Subtitle.Render("✨ spring-clean your disk · made with goroutines and care ✨")
 
-	hint := theme.KeyHint.Render("press [space] to begin · [q] to quit")
+	hint := theme.KeyHint.Render("press [space] to begin · [o] scan options · [q] to quit")
 
 	body := lipgloss.JoinVertical(lipgloss.Center,
 		title,

@@ -39,6 +39,7 @@ type Phase int
 
 const (
 	PhaseSplash Phase = iota
+	PhaseOptions
 	PhaseFDA
 	PhaseScanning
 	PhaseReview
@@ -76,6 +77,9 @@ type Options struct {
 	StartFromReport *report.Report // if non-nil, skip scan and show this report
 	SkipSplash    bool
 	ReportPath    string // path to save reports to / load from
+	// InitialFilter pre-selects a category so a targeted invocation lands on
+	// its answer rather than on everything the scan happened to find.
+	InitialFilter domain.Category
 }
 
 type Model struct {
@@ -117,6 +121,8 @@ type Model struct {
 	flash    string
 	flashAt  time.Time
 	err      string
+
+	form optionsForm
 }
 
 func New(opts Options) Model {
@@ -124,10 +130,11 @@ func New(opts Options) Model {
 		opts:     opts,
 		keys:     newKeymap(),
 		phase:    PhaseSplash,
-		filter:   "",
+		filter:   opts.InitialFilter,
 		sort:     sortBySize,
 		selected: 0,
 	}
+	m.form = newOptionsForm(opts.ScanConfig)
 	if opts.SkipSplash {
 		m.phase = PhaseScanning
 	}
@@ -143,6 +150,11 @@ func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{tickCmd()}
 	if m.opts.StartFromReport == nil {
 		cmds = append(cmds, probeFDACmd(), loadCachedCmd())
+	}
+	// SkipSplash used to set the phase to scanning without ever starting a
+	// scan, leaving the dashboard sitting at zero forever.
+	if m.opts.SkipSplash && m.opts.StartFromReport == nil {
+		cmds = append(cmds, func() tea.Msg { return autoBeginMsg{} })
 	}
 	return tea.Batch(cmds...)
 }
@@ -239,6 +251,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case autoBeginMsg:
+		cmd := m.startScan()
+		return m, cmd
+
 	case scanEventMsg:
 		return m.onScanEvent(msg.ev)
 
@@ -299,6 +315,10 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key.Matches(msg, m.keys.Quit) {
 			return m, tea.Quit
 		}
+		if msg.String() == "o" {
+			m.phase = PhaseOptions
+			return m, nil
+		}
 		if key.Matches(msg, m.keys.Begin) {
 			if !m.fda.Granted && m.fdaDone {
 				m.phase = PhaseFDA
@@ -307,6 +327,8 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			cmd := m.startScan()
 			return m, cmd
 		}
+	case PhaseOptions:
+		return m.onOptionsKey(msg)
 	case PhaseFDA:
 		if key.Matches(msg, m.keys.Quit) || key.Matches(msg, m.keys.Cancel) {
 			return m, tea.Quit
@@ -361,6 +383,84 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// onOptionsKey drives the scope/threshold form. While the path field is being
+// typed into, printable keys go to the text rather than to navigation.
+func (m Model) onOptionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.form.editing {
+		switch msg.Type {
+		case tea.KeyEnter, tea.KeyEsc:
+			m.form.editing = false
+			return m, nil
+		case tea.KeyBackspace:
+			m.form.backspacePath()
+			return m, nil
+		case tea.KeyRunes, tea.KeySpace:
+			m.form.typePath(string(msg.Runes))
+			if msg.Type == tea.KeySpace {
+				m.form.typePath(" ")
+			}
+			return m, nil
+		case tea.KeyCtrlU:
+			m.form.path = ""
+			return m, nil
+		}
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.phase = PhaseSplash
+		m.err = ""
+		return m, nil
+	case "up", "k":
+		m.form.moveCursor(-1)
+		return m, nil
+	case "down", "j", "tab":
+		m.form.moveCursor(1)
+		return m, nil
+	case "left", "h":
+		m.form.adjust(-1)
+		return m, nil
+	case "right", "l":
+		m.form.adjust(1)
+		return m, nil
+	case "e", "enter":
+		// Enter edits the path when the cursor is on it, and otherwise starts
+		// the scan, so the obvious key does the obvious thing in both places.
+		if m.form.cursor == fieldPath && m.form.pathActive() {
+			m.form.editing = true
+			m.form.scope = scopeCustom
+			return m, nil
+		}
+		if msg.String() == "enter" {
+			return m.beginFromOptions()
+		}
+		return m, nil
+	case " ":
+		return m.beginFromOptions()
+	}
+	return m, nil
+}
+
+// beginFromOptions validates the form and starts a scan with it.
+func (m Model) beginFromOptions() (tea.Model, tea.Cmd) {
+	cfg, err := m.form.config()
+	if err != nil {
+		m.err = fmt.Sprintf("%v: %s", err, m.form.path)
+		return m, nil
+	}
+	m.err = ""
+	m.opts.ScanConfig = cfg
+	if !m.fda.Granted && m.fdaDone && cfg.Mode != domain.ModeRoot {
+		m.phase = PhaseFDA
+		return m, nil
+	}
+	cmd := m.startScan()
+	return m, cmd
 }
 
 func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -470,6 +570,9 @@ func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Rescan):
 		cmd := m.startScan()
 		return m, cmd
+	case key.Matches(msg, m.keys.Options):
+		m.phase = PhaseOptions
+		return m, nil
 	}
 	return m, nil
 }
