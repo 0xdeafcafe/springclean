@@ -111,7 +111,9 @@ Occupies     2.4 GB
 Shared       2.4 GB with other copies
 ```
 
-the whole set has to go before shared space comes back, so every copy is still listed — the fiftieth one frees nothing on its own, and hiding it would leave a pile of disk that can never be reclaimed and never appears.
+the whole set has to go before shared space comes back, so every copy is still listed — the fiftieth one frees nothing on its own, and hiding it would leave a pile of disk that can never be reclaimed and never appears. `⧉` in the list marks a row whose size is small for that reason.
+
+shared blocks are charged to whichever copy the scan reached first, so a total over any set of items is exactly what deleting that set frees, while a single row is only exact for the copy that owns the blocks. that is why fifty near-identical worktrees each report a few hundred megabytes rather than one reporting everything: the arithmetic across them still adds up.
 
 this costs one `open` per file. `--no-dedupe` skips it for a faster scan, at the price of counting every clone in full, and `[o]` has the same toggle.
 
