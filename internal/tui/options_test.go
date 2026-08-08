@@ -67,11 +67,18 @@ func TestCursorSkipsHiddenFields(t *testing.T) {
 	if f.visible(fieldPath) || f.visible(fieldWorktreeAge) || f.visible(fieldIgnored) {
 		t.Error("curated scope should hide path and walk-only thresholds")
 	}
-	// Moving down from scope must land on scope again, since nothing else shows.
+	// Whatever the scope hides, a lap of the cursor only ever stops on rows
+	// that are actually on screen.
 	f.cursor = fieldScope
-	f.moveCursor(1)
-	if f.cursor != fieldScope {
-		t.Errorf("cursor = %v, want to stay on scope when it's the only row", f.cursor)
+	for i := 0; i < int(fieldCount)*2; i++ {
+		f.moveCursor(1)
+		if !f.visible(f.cursor) {
+			t.Fatalf("cursor landed on hidden field %v", f.cursor)
+		}
+	}
+	// Real disk use applies to every scope, so curated is never down to one row.
+	if !f.visible(fieldRealSize) {
+		t.Error("the real-size toggle should be available in every scope")
 	}
 
 	f.scope = scopeHere

@@ -35,8 +35,13 @@ func newApplyCmd() *cobra.Command {
 			printDryRun(r)
 
 			if !yesFlag {
-				fmt.Fprintf(os.Stderr, "\nMove %d items (%s) to the Trash? [y/N] ",
+				question := fmt.Sprintf("\nMove %d items (%s) to the Trash? [y/N] ",
 					len(paths), humanize.Bytes(uint64(r.MarkedBytes())))
+				if deleteFlag {
+					question = fmt.Sprintf("\nPermanently delete %d items (%s)? This cannot be undone. [y/N] ",
+						len(paths), humanize.Bytes(uint64(r.MarkedBytes())))
+				}
+				fmt.Fprint(os.Stderr, question)
 				ans, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 				if !isYes(ans) {
 					fmt.Fprintln(os.Stderr, "cancelled.")
@@ -44,15 +49,21 @@ func newApplyCmd() *cobra.Command {
 				}
 			}
 
-			res := trash.MoveMany(paths)
-			if automationDenied(res) && !manualTrashFlag {
-				printAutomationHelp()
-				return errors.New("automation denied; rerun with --manual-trash or grant permission and retry")
+			var res trash.Result
+			switch {
+			case deleteFlag:
+				res = trash.DeleteMany(paths)
+			default:
+				res = trash.MoveMany(paths)
+				if automationDenied(res) && !manualTrashFlag {
+					printAutomationHelp()
+					return errors.New("automation denied; rerun with --manual-trash or grant permission and retry")
+				}
+				if manualTrashFlag {
+					res = trash.MoveManyManual(paths)
+				}
 			}
-			if manualTrashFlag {
-				res = trash.MoveManyManual(paths)
-			}
-			fmt.Fprintf(os.Stderr, "\n✿  trashed %d items via %s\n", len(res.Trashed), res.Method)
+			fmt.Fprintf(os.Stderr, "\n✿  %d items %s\n", len(res.Trashed), outcome(res.Method))
 			if len(res.Skipped) > 0 {
 				fmt.Fprintf(os.Stderr, "  %d items already gone\n", len(res.Skipped))
 			}
@@ -66,6 +77,18 @@ func newApplyCmd() *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+// outcome says what became of the items, for the summary line.
+func outcome(method string) string {
+	switch method {
+	case "deleted":
+		return "deleted"
+	case "manual":
+		return "moved to ~/.Trash"
+	default:
+		return "trashed via Finder"
 	}
 }
 

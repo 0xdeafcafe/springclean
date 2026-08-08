@@ -102,6 +102,8 @@ func (m Model) viewOptions() string {
 	row(fieldIgnoredAge, "cruft age", ageLabel(f.ignoredAge), "how long ignored files must sit unused")
 	row(fieldCacheAge, "hide live caches", cacheAgeLabel(f.cacheAge),
 		"skip caches whose project is still being worked on")
+	row(fieldRealSize, "real disk use", onOff(f.realSize),
+		"count copies that share storage once, not once each")
 
 	heading := theme.PanelTitle.Render("scan options")
 	intro := theme.Subtitle.Render("worktrees and gitignored cruft need a walking scope")
@@ -613,9 +615,18 @@ func (m Model) renderDetailPanel() string {
 		lipgloss.NewStyle().Foreground(theme.Cream).Bold(true).Render(wrapped),
 		"",
 		field("Category", s.Category.Glyph()+" "+s.Category.Label(), lipgloss.NewStyle().Foreground(categoryColor(s.Category))),
-		field("Size", humanize.Bytes(uint64(s.Size)), theme.Highlight),
-		field("Last used", lastUsed, theme.ListItem),
+		field("Frees", humanize.Bytes(uint64(s.Size)), theme.Highlight),
 	}
+	// A tree a package manager installed by cloning costs almost nothing after
+	// the first copy, and the gap between what it occupies and what deleting it
+	// gives back is the whole point.
+	if s.Shared > 0 {
+		rows = append(rows,
+			field("Occupies", humanize.Bytes(uint64(s.Size+s.Shared)), theme.ListItem),
+			field("Shared", humanize.Bytes(uint64(s.Shared))+" with other copies", theme.Dim),
+		)
+	}
+	rows = append(rows, field("Last used", lastUsed, theme.ListItem))
 	// A cache's own mtime says when it was installed. Whether the project
 	// around it is still live is the thing that decides if it should go.
 	if s.Project != "" && !s.ProjectLastUsed.IsZero() {
@@ -697,6 +708,9 @@ func (m Model) phaseBanner() string {
 		return theme.Highlight.Render(fmt.Sprintf("✿ marked %s of %s · press D to trash · R to save report",
 			humanize.Bytes(uint64(marked)), humanize.Bytes(uint64(total))))
 	case PhaseConfirm:
+		if m.applyMode == applyDelete {
+			return theme.Danger.Render("⚠ about to delete items for good — confirm with y / cancel with n")
+		}
 		return theme.Danger.Render("⚠ about to move items to the Trash — confirm with y / cancel with n")
 	case PhaseCelebration:
 		return theme.Good.Render("✿ spring is sprung!")
@@ -735,6 +749,7 @@ func (m Model) renderFooter(scanning bool) string {
 			theme.KeyHint.Render("R") + theme.Dim.Render(" save report"),
 			theme.KeyHint.Render("r") + theme.Dim.Render(" rescan"),
 			theme.KeyHint.Render("D") + theme.Dim.Render(" trash marked"),
+			theme.KeyHint.Render("X") + theme.Dim.Render(" delete marked"),
 			theme.KeyHint.Render("q") + theme.Dim.Render(" quit"),
 		}
 	}
@@ -775,24 +790,49 @@ func (m Model) viewConfirm() string {
 			c.Glyph(), c.Label(), v.count, humanize.Bytes(uint64(v.bytes))))
 	}
 
+	things := fmt.Sprintf("%d items", count)
+	if count == 1 {
+		things = "1 item"
+	}
+
 	heading := theme.Title.Render("✿  Ready to spring-clean")
-	question := theme.Highlight.Render(fmt.Sprintf("Move %d items (%s) to the Trash?",
-		count, humanize.Bytes(uint64(marked))))
-	breakdown := lipgloss.NewStyle().Foreground(theme.Cream).Render(strings.Join(lines, "\n"))
+	question := theme.Highlight.Render(fmt.Sprintf("Move %s (%s) to the Trash?",
+		things, humanize.Bytes(uint64(marked))))
 	note := theme.Subtitle.Render("Items go to ~/.Trash (Finder \"Put Back\" preserved). You can sanity-check before emptying.")
 	hint := theme.KeyHint.Render("[y/enter] yes, sweep it · [n/esc] cancel")
+	border := theme.Sun
 
+	if m.applyMode == applyDelete {
+		heading = theme.Danger.Render("⚠  Delete, not trash")
+		question = theme.Danger.Render(fmt.Sprintf("Permanently delete %s (%s)?",
+			things, humanize.Bytes(uint64(marked))))
+		note = theme.Subtitle.Render("Straight to gone: no Trash, no Put Back, no emptying a bin of\n" +
+			"a hundred thousand files afterwards. Nothing here comes back.")
+		hint = theme.KeyHint.Render("[y/enter] I'm sure · [n/esc] cancel")
+		border = theme.Warning
+		if m.confirmStep > 0 {
+			question = theme.Danger.Render(fmt.Sprintf("Really? %s (%s), gone for good.",
+				things, humanize.Bytes(uint64(marked))))
+			hint = theme.KeyHint.Render("[y/enter] delete them · [n/esc] cancel")
+		}
+	}
+
+	breakdown := lipgloss.NewStyle().Foreground(theme.Cream).Render(strings.Join(lines, "\n"))
 	body := lipgloss.JoinVertical(lipgloss.Left,
 		heading, "", question, "", breakdown, "", note, "", hint)
-	panel := theme.Panel.BorderForeground(theme.Sun).Width(min(80, m.width-4)).Render(body)
+	panel := theme.Panel.BorderForeground(border).Width(min(80, m.width-4)).Render(body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
 }
 
 func (m Model) viewApplying() string {
+	what := "moving items to the Trash via Finder"
+	if m.applyMode == applyDelete {
+		what = "deleting items"
+	}
 	body := lipgloss.JoinVertical(lipgloss.Center,
 		theme.Title.Render("✿ sweeping…"),
 		"",
-		theme.Subtitle.Render("moving items to the Trash via Finder"),
+		theme.Subtitle.Render(what),
 		"",
 		theme.Highlight.Render(animatedSpinner(m.animTick)),
 	)
@@ -923,6 +963,12 @@ func categoryColor(c domain.Category) lipgloss.Color {
 	return theme.Cream
 }
 
+// truncatePath shortens a path to fit, keeping as many trailing components as
+// there is room for.
+//
+// The tail is what tells two paths apart. A list of build caches is fifty rows
+// all ending in `node_modules`, and it's the directory above that says which
+// worktree each one belongs to; the leading directories they share say nothing.
 func truncatePath(p string, max int) string {
 	if max < 10 {
 		max = 10
@@ -935,16 +981,18 @@ func truncatePath(p string, max int) string {
 		return p
 	}
 	parts := strings.Split(p, string(filepath.Separator))
-	if len(parts) < 3 {
+	tail := parts[len(parts)-1]
+	if len(tail)+2 > max {
 		return "…" + p[len(p)-max+1:]
 	}
-	last := parts[len(parts)-1]
-	prefix := parts[0]
-	avail := max - len(prefix) - len(last) - 5
-	if avail < 0 {
-		return "…" + p[len(p)-max+1:]
+	for i := len(parts) - 2; i > 0; i-- {
+		grown := parts[i] + "/" + tail
+		if len(grown)+2 > max {
+			break
+		}
+		tail = grown
 	}
-	return prefix + "/…/" + last
+	return "…/" + tail
 }
 
 func wrapPath(p string, w int) string {

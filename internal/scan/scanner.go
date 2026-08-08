@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/0xdeafcafe/springclean/internal/catalog"
+	"github.com/0xdeafcafe/springclean/internal/disk"
 	"github.com/0xdeafcafe/springclean/internal/domain"
 	"github.com/dustin/go-humanize"
 )
@@ -57,6 +58,14 @@ type Config struct {
 	// checkout somebody has worked on within this many days. Zero reports every
 	// cache found, which is the default.
 	CacheAgeDays int
+
+	// SkipDedupe charges every copy of a file in full instead of working out
+	// whether copies share their storage.
+	//
+	// Detecting that costs an open per file, and it is what keeps fifty pnpm
+	// checkouts of one lockfile from looking like fifty times the disk they
+	// actually take. Sizes stay block-accurate either way.
+	SkipDedupe bool
 }
 
 type Scanner struct {
@@ -93,6 +102,10 @@ type Scanner struct {
 
 	skipSet map[string]bool
 	markers map[string]catalog.StopMarker
+
+	// claims records storage already counted, so a file cloned or hard linked
+	// into several suspects is only charged to the first one that finds it.
+	claims *disk.Claims
 }
 
 func New(cfg Config) *Scanner {
@@ -120,6 +133,7 @@ func New(cfg Config) *Scanner {
 		seen:    map[string]bool{},
 		skipSet: skipSet,
 		markers: catalog.StopMarkers(),
+		claims:  disk.NewClaims(!cfg.SkipDedupe),
 	}
 }
 
@@ -290,7 +304,7 @@ func (s *Scanner) markSeen(path string) bool {
 }
 
 func (s *Scanner) emit(suspect domain.Suspect) {
-	if suspect.Size < s.cfg.MinSize {
+	if suspect.Footprint() < s.cfg.MinSize {
 		return
 	}
 	s.suspMu.Lock()
@@ -409,31 +423,36 @@ func (s *Scanner) checkFileHeuristics(path string, info fs.FileInfo) {
 		age := time.Since(info.ModTime())
 		if age > catalog.DownloadAgeDays*24*time.Hour && sz >= 10*1024*1024 {
 			days := int(age.Hours() / 24)
-			s.emit(domain.Suspect{
+			sus := domain.Suspect{
 				ID:          domain.MakeID(path),
 				Path:        path,
-				Size:        sz,
 				Category:    domain.CatDownload,
 				Reason:      fmt.Sprintf("Download untouched for %d days", days),
 				IsDir:       false,
 				LastUsed:    info.ModTime(),
 				Regenerable: false,
-			})
+			}
+			// Only files that make it this far are measured properly: the
+			// claim costs an open, and the walk passes through every file in
+			// the tree.
+			record(&sus, s.claims.Charge(path, info))
+			s.emit(sus)
 			return
 		}
 	}
 
 	if sz >= catalog.LargeFileThreshold {
-		s.emit(domain.Suspect{
+		sus := domain.Suspect{
 			ID:          domain.MakeID(path),
 			Path:        path,
-			Size:        sz,
 			Category:    domain.CatLargeFile,
 			Reason:      fmt.Sprintf("Large file (%s)", humanize.Bytes(uint64(sz))),
 			IsDir:       false,
 			LastUsed:    info.ModTime(),
 			Regenerable: false,
-		})
+		}
+		record(&sus, s.claims.Charge(path, info))
+		s.emit(sus)
 	}
 }
 
@@ -477,13 +496,13 @@ func (s *Scanner) sizeCache(path string, cat domain.Category, reason string, reg
 		sus := domain.Suspect{
 			ID:          domain.MakeID(path),
 			Path:        path,
-			Size:        s.sumDir(path),
 			Category:    cat,
 			Reason:      reason,
 			IsDir:       true,
 			LastUsed:    info.ModTime(),
 			Regenerable: regen,
 		}
+		record(&sus, s.sumDir(path))
 		if proj.known() {
 			sus.Project = proj.root
 			sus.ProjectLastUsed = proj.touched
@@ -508,24 +527,23 @@ func (s *Scanner) sizeWhole(path string, cat domain.Category, reason string, reg
 		if info.Mode()&os.ModeSymlink != 0 {
 			return
 		}
-		var size int64
+		var usage disk.Usage
 		if info.IsDir() {
-			size = s.sumDir(path)
+			usage = s.sumDir(path)
 		} else {
-			size = info.Size()
-			s.bytes.Add(size)
-			s.items.Add(1)
+			usage = s.sumFile(path, info)
 		}
-		s.emit(domain.Suspect{
+		sus := domain.Suspect{
 			ID:          domain.MakeID(path),
 			Path:        path,
-			Size:        size,
 			Category:    cat,
 			Reason:      reason,
 			IsDir:       info.IsDir(),
 			LastUsed:    info.ModTime(),
 			Regenerable: regen,
-		})
+		}
+		record(&sus, usage)
+		s.emit(sus)
 	})
 }
 
@@ -550,12 +568,28 @@ func (s *Scanner) sizeContents(path string, cat domain.Category, reason string, 
 	})
 }
 
-// sumDir walks `root` in parallel and returns the total size of regular files
-// underneath. A local semaphore caps fan-out so this can't starve the global
-// worker pool that called us. Per-directory atomic batching keeps cache
+// record puts a measurement on a suspect. Size is what deleting the item
+// frees; Apparent is what its files add up to on paper.
+func record(sus *domain.Suspect, u disk.Usage) {
+	sus.Size = u.Real
+	sus.Apparent = u.Apparent
+	sus.Shared = u.Shared
+}
+
+// sumFile measures one regular file, counting it towards the scan totals.
+func (s *Scanner) sumFile(path string, info os.FileInfo) disk.Usage {
+	u := s.claims.Charge(path, info)
+	s.bytes.Add(u.Apparent)
+	s.items.Add(1)
+	return u
+}
+
+// sumDir walks `root` in parallel and returns what the regular files
+// underneath cost. A local semaphore caps fan-out so this can't starve the
+// global worker pool that called us. Per-directory atomic batching keeps cache
 // contention low when many workers are active. Symlinks are not followed.
-func (s *Scanner) sumDir(root string) int64 {
-	var total atomic.Int64
+func (s *Scanner) sumDir(root string) disk.Usage {
+	var apparent, actual, shared atomic.Int64
 	localSem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 
@@ -576,7 +610,7 @@ func (s *Scanner) sumDir(root string) int64 {
 			}
 			return
 		}
-		var localBytes int64
+		var local disk.Usage
 		var localItems int64
 		for _, e := range entries {
 			p := filepath.Join(dir, e.Name())
@@ -592,19 +626,21 @@ func (s *Scanner) sumDir(root string) int64 {
 				go walk(p)
 				continue
 			}
-			localBytes += info.Size()
+			local.Add(s.claims.Charge(p, info))
 			localItems++
 		}
-		if localBytes > 0 || localItems > 0 {
-			total.Add(localBytes)
-			s.bytes.Add(localBytes)
+		if local.Apparent > 0 || localItems > 0 {
+			apparent.Add(local.Apparent)
+			actual.Add(local.Real)
+			shared.Add(local.Shared)
+			s.bytes.Add(local.Apparent)
 			s.items.Add(localItems)
 		}
 	}
 	wg.Add(1)
 	walk(root)
 	wg.Wait()
-	return total.Load()
+	return disk.Usage{Apparent: apparent.Load(), Real: actual.Load(), Shared: shared.Load()}
 }
 
 func isHiddenSkip(name string) bool {
@@ -651,7 +687,7 @@ func (s *Scanner) emitWorktree(dir, gitDir string) (time.Time, bool) {
 		return touched, false
 	}
 
-	size := s.sumDir(dir)
+	usage := s.sumDir(dir)
 	git := readGitState(s.ctx, dir)
 	days := int(age.Hours() / 24)
 
@@ -660,10 +696,9 @@ func (s *Scanner) emitWorktree(dir, gitDir string) (time.Time, bool) {
 		reason = fmt.Sprintf("%s (%s)", reason, git.Branch)
 	}
 
-	s.emit(domain.Suspect{
+	sus := domain.Suspect{
 		ID:          domain.MakeID(dir),
 		Path:        dir,
-		Size:        size,
 		Category:    domain.CatGitWorktree,
 		Reason:      reason,
 		IsDir:       true,
@@ -671,7 +706,9 @@ func (s *Scanner) emitWorktree(dir, gitDir string) (time.Time, bool) {
 		Regenerable: false,
 		Warning:     git.Warning(),
 		GitDir:      gitDir,
-	})
+	}
+	record(&sus, usage)
+	s.emit(sus)
 	return touched, true
 }
 

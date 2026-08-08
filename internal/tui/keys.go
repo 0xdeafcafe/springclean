@@ -18,6 +18,7 @@ type keymap struct {
 	PrevCat   key.Binding
 	Sort      key.Binding
 	Apply     key.Binding
+	Delete    key.Binding
 	Save      key.Binding
 	Edit      key.Binding
 	Rescan    key.Binding
@@ -46,6 +47,7 @@ func newKeymap() keymap {
 		PrevCat:   key.NewBinding(key.WithKeys("left", "h", "["), key.WithHelp("←", "prev tab")),
 		Sort:      key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "sort")),
 		Apply:     key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "apply (trash marked)")),
+		Delete:    key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "delete marked, no trash")),
 		Save:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "save report")),
 		Edit:      key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit report in $EDITOR")),
 		Rescan:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "re-scan")),

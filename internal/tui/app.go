@@ -116,6 +116,8 @@ type Model struct {
 	applyResult trash.Result
 	applyErr    error
 	confirmStep int
+	// applyMode is what the pending confirmation will do.
+	applyMode applyMode
 
 	helpOpen bool
 	flash    string
@@ -201,12 +203,29 @@ func (m *Model) startScan() tea.Cmd {
 	return waitForScanEvent(m.scanCh)
 }
 
-func applyCmd(paths []string, manual bool) tea.Cmd {
+// applyMode is where marked items go.
+type applyMode int
+
+const (
+	// applyTrash is the default: Finder moves the items, so Put Back works.
+	applyTrash applyMode = iota
+	// applyManualTrash writes into ~/.Trash directly, for when macOS won't
+	// let the terminal drive Finder.
+	applyManualTrash
+	// applyDelete removes them outright. Faster by a wide margin on a tree of
+	// many small files, and irreversible.
+	applyDelete
+)
+
+func applyCmd(paths []string, mode applyMode) tea.Cmd {
 	return func() tea.Msg {
 		var res trash.Result
-		if manual {
+		switch mode {
+		case applyManualTrash:
 			res = trash.MoveManyManual(paths)
-		} else {
+		case applyDelete:
+			res = trash.DeleteMany(paths)
+		default:
 			res = trash.MoveMany(paths)
 		}
 		return applyDoneMsg{result: res}
@@ -368,11 +387,11 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "r", "y", "enter":
 			paths := m.markedPaths()
 			m.phase = PhaseApplying
-			return m, applyCmd(paths, false)
+			return m, applyCmd(paths, applyTrash)
 		case "m":
 			paths := m.markedPaths()
 			m.phase = PhaseApplying
-			return m, applyCmd(paths, true)
+			return m, applyCmd(paths, applyManualTrash)
 		}
 	case PhaseCelebration:
 		if key.Matches(msg, m.keys.Quit) {
@@ -582,6 +601,15 @@ func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.phase = PhaseConfirm
 		m.confirmStep = 0
+		m.applyMode = applyTrash
+	case key.Matches(msg, m.keys.Delete):
+		if m.markedCount() == 0 {
+			m.setFlash("nothing marked")
+			return m, nil
+		}
+		m.phase = PhaseConfirm
+		m.confirmStep = 0
+		m.applyMode = applyDelete
 	case key.Matches(msg, m.keys.Rescan):
 		cmd := m.startScan()
 		return m, cmd
@@ -598,9 +626,15 @@ func (m Model) onConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if key.Matches(msg, m.keys.Confirm) {
+		// Deleting is irreversible, so it takes a second look rather than the
+		// single keypress that sending things to the Trash gets.
+		if m.applyMode == applyDelete && m.confirmStep == 0 {
+			m.confirmStep = 1
+			return m, nil
+		}
 		paths := m.markedPaths()
 		m.phase = PhaseApplying
-		return m, applyCmd(paths, false)
+		return m, applyCmd(paths, m.applyMode)
 	}
 	return m, nil
 }

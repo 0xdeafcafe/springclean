@@ -157,6 +157,42 @@ type Suspect struct {
 	// own mtime says only when it was last installed.
 	Project         string    `yaml:"project,omitempty"`
 	ProjectLastUsed time.Time `yaml:"project_last_used,omitempty"`
+
+	// Apparent is the sum of the logical file sizes underneath, and Shared is
+	// the part of the real footprint that lives in blocks another suspect also
+	// references, through hard links or APFS clones.
+	//
+	// Size is what deleting this frees; Apparent is what a directory listing
+	// adds up to. They diverge wildly for anything a package manager installed
+	// by cloning: fifty pnpm checkouts of one lockfile are fifty times the
+	// apparent size and one time the real one.
+	Apparent int64 `yaml:"apparent_bytes,omitempty"`
+	Shared   int64 `yaml:"shared_bytes,omitempty"`
+}
+
+// Duplicated reports whether most of this item's bytes are storage something
+// else in the same scan also holds, which means deleting it frees far less
+// than its apparent size suggests.
+func (s Suspect) Duplicated() bool {
+	return s.Shared > 0 && s.Shared > s.Size
+}
+
+// Footprint is how much room the item takes up, as opposed to how much
+// deleting it would free. The two differ for a copy that shares its storage
+// with another one.
+//
+// Size floors are judged on this. The fiftieth clone of a node_modules frees
+// nothing on its own, but it is still a gigabyte of files, and every copy has
+// to go before any of the space comes back, so hiding all but the first would
+// leave a pile of disk unreclaimable and invisible.
+func (s Suspect) Footprint() int64 {
+	// Size and Shared are both allocated bytes, and together they are what the
+	// item occupies. Apparent can still be the larger of the two on a
+	// filesystem that compresses, so it gets a look in.
+	if alloc := s.Size + s.Shared; alloc > s.Apparent {
+		return alloc
+	}
+	return s.Apparent
 }
 
 // MainRepoFromGitDir maps a linked worktree's admin directory back to the

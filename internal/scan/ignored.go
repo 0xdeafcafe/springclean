@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0xdeafcafe/springclean/internal/catalog"
+	"github.com/0xdeafcafe/springclean/internal/disk"
 	"github.com/0xdeafcafe/springclean/internal/domain"
 	"github.com/dustin/go-humanize"
 )
@@ -198,25 +199,23 @@ func (s *Scanner) sizeIgnored(path string, isDir bool) {
 			return
 		}
 
-		var size int64
+		var usage disk.Usage
 		var touched time.Time
 		if isDir && info.IsDir() {
 			if containsCheckout(path, 3) {
 				return
 			}
-			size = s.sumDir(path)
+			usage = s.sumDir(path)
 			touched = contentModTime(s.ctx, path)
 		} else {
-			size = info.Size()
+			usage = s.sumFile(path, info)
 			touched = info.ModTime()
-			s.bytes.Add(size)
-			s.items.Add(1)
 		}
 		if touched.IsZero() {
 			touched = info.ModTime()
 		}
 
-		if size < catalog.IgnoredCruftMinSize {
+		if max(usage.Real, usage.Apparent) < catalog.IgnoredCruftMinSize {
 			return
 		}
 		age := time.Since(touched)
@@ -224,20 +223,21 @@ func (s *Scanner) sizeIgnored(path string, isDir bool) {
 			return
 		}
 
-		s.emit(domain.Suspect{
+		sus := domain.Suspect{
 			ID:       domain.MakeID(path),
 			Path:     path,
-			Size:     size,
 			Category: domain.CatIgnoredCruft,
 			Reason: fmt.Sprintf("Gitignored %s, untouched for %d days (%s)",
-				kindWord(info.IsDir()), int(age.Hours()/24), humanize.Bytes(uint64(size))),
+				kindWord(info.IsDir()), int(age.Hours()/24), humanize.Bytes(uint64(usage.Real))),
 			IsDir:    info.IsDir(),
 			LastUsed: touched,
 			// Ignored by git means it isn't source, but it isn't necessarily
 			// reproducible either: a dumped database won't come back from a
 			// build step. Leave the regenerable claim to the marker list.
 			Regenerable: false,
-		})
+		}
+		record(&sus, usage)
+		s.emit(sus)
 	})
 }
 

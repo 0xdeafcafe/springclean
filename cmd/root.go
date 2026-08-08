@@ -14,10 +14,10 @@ import (
 )
 
 var (
-	scopeFlag      string
-	rootFlag       string
-	reportPathFlag string
-	yesFlag        bool
+	scopeFlag       string
+	rootFlag        string
+	reportPathFlag  string
+	yesFlag         bool
 	manualTrashFlag bool
 	worktreeAgeFlag int
 	ignoredAgeFlag  int
@@ -25,6 +25,8 @@ var (
 	noPruneFlag     bool
 	hereFlag        bool
 	cacheAgeFlag    int
+	noDedupeFlag    bool
+	deleteFlag      bool
 )
 
 func newRootCmd() *cobra.Command {
@@ -32,7 +34,9 @@ func newRootCmd() *cobra.Command {
 		Use:   "springclean",
 		Short: "✿ spring-clean your disk — a TUI for finding & trashing the gunk",
 		Long: "springclean walks your home directory and known macOS caches to find disk-space hogs,\n" +
-			"then lets you review and mark items for the Trash. Move-to-trash only — never rm.",
+			"then lets you review and mark items for the Trash, or delete them outright if you'd\n" +
+			"rather skip the bin. Sizes are what deleting would actually free, so copies that\n" +
+			"share storage are counted once rather than once each.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := scanConfigFromFlags()
@@ -62,6 +66,10 @@ func newRootCmd() *cobra.Command {
 		"scan the current directory (shorthand for --scope=root --root=.)")
 	cmd.PersistentFlags().IntVar(&cacheAgeFlag, "cache-age", 0,
 		"hide build/dependency caches whose project was worked on in the last N days (0 shows all)")
+	cmd.PersistentFlags().BoolVar(&noDedupeFlag, "no-dedupe", false,
+		"skip working out which copies share storage (faster scan; counts every clone and hard link in full)")
+	cmd.PersistentFlags().BoolVar(&deleteFlag, "delete", false,
+		"delete outright instead of moving to the Trash (apply) — irreversible")
 
 	cmd.AddCommand(newWorktreesCmd())
 	cmd.AddCommand(newScanCmd())
@@ -88,6 +96,7 @@ func scanConfigFromFlags() (scan.Config, error) {
 		IgnoredAgeDays:  ignoredAgeFlag,
 		ScanIgnored:     scanIgnoredFlag,
 		CacheAgeDays:    cacheAgeFlag,
+		SkipDedupe:      noDedupeFlag,
 	}
 
 	// --here is shorthand for pointing --scope=root at the working directory.

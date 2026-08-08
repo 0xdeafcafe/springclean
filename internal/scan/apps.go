@@ -59,22 +59,23 @@ func (s *Scanner) checkApp(appPath string) {
 		return
 	}
 
-	size := s.sumDir(appPath)
-	if size < s.cfg.MinSize {
+	usage := s.sumDir(appPath)
+	if max(usage.Real, usage.Apparent) < s.cfg.MinSize {
 		return
 	}
 
 	days := int(age.Hours() / 24)
-	s.emit(domain.Suspect{
+	sus := domain.Suspect{
 		ID:          domain.MakeID(appPath),
 		Path:        appPath,
-		Size:        size,
 		Category:    domain.CatUnusedApp,
 		Reason:      fmt.Sprintf("Not opened in %d days", days),
 		IsDir:       info.IsDir(),
 		LastUsed:    lastUsed,
 		Regenerable: false,
-	})
+	}
+	record(&sus, usage)
+	s.emit(sus)
 }
 
 // mdlsLastUsed reads kMDItemLastUsedDate via the macOS `mdls` tool.

@@ -2,7 +2,7 @@
 
 your mac collects a frankly embarrassing amount of garbage. xcode derived data nobody asked for, sixteen copies of `node_modules` from projects you renamed in 2023, a git worktree you forgot existed, an app you opened once in 2024 and then never again. springclean walks your disk, finds the gunk, and lets you mark what goes in the trash.
 
-nothing gets `rm -rf`'d. everything goes through finder so "put back" still works. you stay in charge — it just shows you what's there.
+everything goes through finder by default, so "put back" still works. if you'd rather skip the bin for something you were going to reinstall anyway, `X` deletes outright and asks twice first. you stay in charge — it just shows you what's there.
 
 designed in a fit of disk-pressure panic, built in claude.
 
@@ -59,7 +59,7 @@ three flavours:
 
 worktrees, large files and gitignored cruft only turn up in the two walking scopes. curated never touches the filesystem beyond the known cache paths, so pointing it at a project and expecting worktrees won't work.
 
-you don't have to remember any of that. press `[o]` on the splash screen for the scan options: scope, which folder, how stale a worktree has to be, whether to ask git about ignored files. `[o]` again from the results re-runs with different settings.
+you don't have to remember any of that. press `[o]` on the splash screen for the scan options: scope, which folder, how stale a worktree has to be, whether to ask git about ignored files, whether to work out real disk use. `[o]` again from the results re-runs with different settings.
 
 from the shell there are shorter forms than spelling out the scope:
 
@@ -97,9 +97,29 @@ worktrees are dated from their newest source file, which is exact. every other c
 
 directories holding checkouts are left alone. keeping worktrees somewhere gitignored is normal, and collapsing that into a single suspect would offer all of them for deletion at once, so those are walked through and judged individually instead.
 
+## how big things really are
+
+sizes are what deleting something would actually give you back, which is not what adding up its files says.
+
+three things get in the way. small files occupy a whole block each, so a directory of ten thousand tiny ones takes more room than its bytes suggest. hard links are one set of blocks under several names. and apfs `clonefile` gives two files their own inodes while they share every block, which is how pnpm installs a package into fifty checkouts, and how `du` comes to report fifty times the space that deleting all fifty would free.
+
+so springclean counts blocks rather than bytes, and asks the filesystem where each file physically lives so a second copy of something is charged what it really costs. the details panel spells out the difference when there is one:
+
+```
+Frees        44 MB
+Occupies     2.4 GB
+Shared       2.4 GB with other copies
+```
+
+the whole set has to go before shared space comes back, so every copy is still listed — the fiftieth one frees nothing on its own, and hiding it would leave a pile of disk that can never be reclaimed and never appears.
+
+this costs one `open` per file. `--no-dedupe` skips it for a faster scan, at the price of counting every clone in full, and `[o]` has the same toggle.
+
 ## the move-to-trash bit
 
 uses finder via osascript by default, which preserves "put back" metadata so you can drag stuff out of the bin if you regret it. if macos blocks the automation prompt, rerun with `--manual-trash` and it'll move files to `~/.Trash` directly (no put-back, but it works).
+
+`X` deletes instead, skipping the trash entirely. this exists because the trash is a bad deal for a `node_modules`: finder moves a hundred thousand files in, then makes you watch it delete them one at a time when you empty the bin, all to protect something you were going to reinstall anyway. it asks twice, and nothing comes back. `springclean apply report.yaml --delete` does the same from the shell.
 
 ## things it deliberately doesn't touch
 

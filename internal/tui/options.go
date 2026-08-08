@@ -60,6 +60,7 @@ const (
 	fieldIgnored
 	fieldIgnoredAge
 	fieldCacheAge
+	fieldRealSize
 	fieldCount
 )
 
@@ -70,6 +71,7 @@ type optionsForm struct {
 	ignored     bool
 	ignoredAge  int
 	cacheAge    int
+	realSize    bool
 
 	cursor  formField
 	editing bool // typing into the path field
@@ -81,6 +83,7 @@ func newOptionsForm(cfg scan.Config) optionsForm {
 		ignored:     cfg.ScanIgnored,
 		ignoredAge:  cfg.IgnoredAgeDays,
 		cacheAge:    cfg.CacheAgeDays,
+		realSize:    !cfg.SkipDedupe,
 	}
 	if f.worktreeAge == 0 {
 		f.worktreeAge = catalog.WorktreeAgeDays
@@ -188,6 +191,8 @@ func (f *optionsForm) adjust(delta int) {
 		if f.cacheAge > 3650 {
 			f.cacheAge = 3650
 		}
+	case fieldRealSize:
+		f.realSize = !f.realSize
 	}
 }
 
@@ -263,6 +268,7 @@ func (f optionsForm) config() (scan.Config, error) {
 		IgnoredAgeDays:  f.ignoredAge,
 		ScanIgnored:     f.ignored,
 		CacheAgeDays:    f.cacheAge,
+		SkipDedupe:    !f.realSize,
 	}
 	switch f.scope {
 	case scopeCurated:
