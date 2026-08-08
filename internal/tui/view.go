@@ -549,11 +549,15 @@ func (m Model) renderListRow(s domain.Suspect, selected bool, innerWidth int) st
 	}
 	glyph := lipgloss.NewStyle().Foreground(categoryColor(s.Category)).Render(s.Category.Glyph())
 	size := lipgloss.NewStyle().Foreground(theme.Sun).Bold(true).Render(humanize.Bytes(uint64(s.Size)))
-	// Unsaved work is the one thing worth seeing without opening the detail
-	// panel, so it gets a column of its own in the row.
+	// One column for the two things worth knowing before opening the detail
+	// panel: that an item holds unsaved work, or that its size is small
+	// because other copies are holding the same blocks.
 	risk := " "
-	if s.Warning != "" {
+	switch {
+	case s.Warning != "":
 		risk = theme.Danger.Render("⚠")
+	case s.Duplicated():
+		risk = theme.Dim.Render("⧉")
 	}
 	pathStr := truncatePath(s.Path, innerWidth-24)
 	row := fmt.Sprintf("%s %s %s  %s  %s", mark, risk, glyph, padRight(size, 9), pathStr)

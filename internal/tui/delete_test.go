@@ -114,6 +114,27 @@ func TestDeleteWithNothingMarkedDoesNothing(t *testing.T) {
 	}
 }
 
+// TestDuplicatedItemsAreFlaggedInTheList: a node_modules showing 44 MB next to
+// one showing 2 GB needs something in the row to explain itself.
+func TestDuplicatedItemsAreFlaggedInTheList(t *testing.T) {
+	m := reviewModel(t)
+	m.suspects[0].Size = 44_000
+	m.suspects[0].Shared = 2_000_000
+	m.rebuildView()
+
+	row := m.renderListRow(m.suspects[0], false, 80)
+	if !strings.Contains(row, "⧉") {
+		t.Errorf("a mostly-shared item should be marked in the list\n%s", row)
+	}
+
+	// Unsaved work still wins the column: it matters more.
+	m.suspects[0].Warning = "uncommitted changes"
+	row = m.renderListRow(m.suspects[0], false, 80)
+	if !strings.Contains(row, "⚠") || strings.Contains(row, "⧉") {
+		t.Errorf("unsaved work should take the column\n%s", row)
+	}
+}
+
 // TestDeleteConfirmStepResets guards against a second delete inheriting the
 // escalation from the first and going straight through.
 func TestDeleteConfirmStepResets(t *testing.T) {
