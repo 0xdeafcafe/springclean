@@ -25,3 +25,8 @@ type cachedScanLoadedMsg struct {
 	result domain.ScanResult
 	ok     bool
 }
+
+// autoBeginMsg starts a scan without waiting on the splash screen. It exists
+// because Init can't mutate the model, so kicking the scan off has to travel
+// through Update like any other event.
+type autoBeginMsg struct{}

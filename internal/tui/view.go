@@ -28,6 +28,8 @@ func (m Model) View() string {
 	switch m.phase {
 	case PhaseSplash:
 		return m.viewSplash()
+	case PhaseOptions:
+		return m.viewOptions()
 	case PhaseFDA:
 		return m.viewFDA()
 	case PhaseScanning:
@@ -44,6 +46,137 @@ func (m Model) View() string {
 		return m.viewCelebration()
 	}
 	return ""
+}
+
+func (m Model) viewOptions() string {
+	f := m.form
+
+	panelWidth := min(84, m.width-4)
+	// Border, padding and the two-column label gutter come off the top before
+	// anything is allowed to occupy a line.
+	const labelWidth = 18
+	inner := panelWidth - 8
+	valueWidth := inner - labelWidth - 2
+	if valueWidth < 12 {
+		valueWidth = 12
+	}
+
+	var body []string
+	row := func(field formField, label, value, note string) {
+		if !f.visible(field) {
+			return
+		}
+		cursor := "  "
+		labelStyle := theme.Dim
+		valueStyle := lipgloss.NewStyle().Foreground(theme.Cream)
+		if f.cursor == field {
+			cursor = lipgloss.NewStyle().Foreground(theme.Sun).Render("▸ ")
+			labelStyle = lipgloss.NewStyle().Foreground(theme.Sun)
+			valueStyle = lipgloss.NewStyle().Foreground(theme.Sun).Bold(true)
+		}
+		body = append(body, cursor+labelStyle.Render(padRight(label, labelWidth))+
+			valueStyle.Render(truncateMiddle(value, valueWidth)))
+		// The explanation belongs to whichever row is selected. Showing every
+		// one at once overflowed the panel and wrapped into the border.
+		if f.cursor == field && note != "" {
+			body = append(body, theme.Dim.Render(strings.Repeat(" ", labelWidth+2)+
+				truncateMiddle(note, valueWidth)))
+		}
+	}
+
+	// The tail of a path identifies it; truncatePath collapses the middle so
+	// aggressively that two sibling directories look identical here.
+	pathValue := truncateHead(shortenHome(f.path), valueWidth)
+	if f.cursor == fieldPath && f.editing {
+		pathValue = truncateHead(shortenHome(f.path), valueWidth-1) + "▏"
+	}
+	pathNote := "[e] to edit, [enter] to accept"
+	if f.editing {
+		pathNote = "typing… [enter] done · [ctrl+u] clear"
+	}
+
+	row(fieldScope, "scope", f.scope.Label(), f.scope.Blurb())
+	row(fieldPath, "path", pathValue, pathNote)
+	row(fieldWorktreeAge, "stale worktrees", ageLabel(f.worktreeAge), "untouched for at least this long")
+	row(fieldIgnored, "gitignored cruft", onOff(f.ignored), "ask git for big, stale ignored files")
+	row(fieldIgnoredAge, "cruft age", ageLabel(f.ignoredAge), "how long ignored files must sit unused")
+	row(fieldCacheAge, "hide live caches", cacheAgeLabel(f.cacheAge),
+		"skip caches whose project is still being worked on")
+	row(fieldRealSize, "real disk use", onOff(f.realSize),
+		"count copies that share storage once, not once each")
+
+	heading := theme.PanelTitle.Render("scan options")
+	intro := theme.Subtitle.Render("worktrees and gitignored cruft need a walking scope")
+
+	hint := theme.KeyHint.Render("[↑↓] field · [←→] change · [space] scan · [esc] back")
+
+	parts := []string{heading, "", intro, ""}
+	parts = append(parts, body...)
+	if m.err != "" {
+		parts = append(parts, "", theme.Danger.Render(truncateMiddle("⚠  "+m.err, inner)))
+	}
+	parts = append(parts, "", hint)
+
+	panel := theme.Panel.BorderForeground(theme.Lavender).
+		Width(panelWidth).
+		Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+// truncateMiddle shortens plain text to fit, keeping both ends readable.
+func truncateMiddle(s string, max int) string {
+	r := []rune(s)
+	if max < 6 {
+		max = 6
+	}
+	if len(r) <= max {
+		return s
+	}
+	keep := max - 1
+	head := keep / 2
+	tail := keep - head
+	return string(r[:head]) + "…" + string(r[len(r)-tail:])
+}
+
+// shortenHome swaps the home directory prefix for `~`.
+func shortenHome(p string) string {
+	home, err := homeDir()
+	if err == nil && home != "" && strings.HasPrefix(p, home) {
+		return "~" + p[len(home):]
+	}
+	return p
+}
+
+// truncateHead keeps the tail of a string, which is what matters while the
+// user is typing a path.
+func truncateHead(s string, max int) string {
+	r := []rune(s)
+	if max < 4 {
+		max = 4
+	}
+	if len(r) <= max {
+		return s
+	}
+	return "…" + string(r[len(r)-(max-1):])
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+// cacheAgeLabel reads as a filter rather than a threshold, because 0 here
+// means "show everything" rather than "no waiting period".
+func cacheAgeLabel(days int) string {
+	if days <= 0 {
+		return "off (show every cache)"
+	}
+	if days == 1 {
+		return "project idle 1+ day"
+	}
+	return "project idle " + itoa(days) + "+ days"
 }
 
 func (m Model) viewPermissionDenied() string {
@@ -318,13 +451,8 @@ func (m Model) renderCategoryChips() string {
 		counts[""]++
 		bytesBy[""] += s.Size
 	}
-	cats := []domain.Category{""}
-	for _, c := range domain.AllCategories() {
-		if counts[c] > 0 {
-			cats = append(cats, c)
-		}
-	}
 	var chips []string
+	cats := m.visibleCategories()
 	for _, c := range cats {
 		label := "All"
 		glyph := "✦"
@@ -342,15 +470,58 @@ func (m Model) renderCategoryChips() string {
 	return strings.Join(chips, theme.Dim.Render(" "))
 }
 
+// renderSearchLine draws the `/` prompt, or a reminder of the query that's
+// narrowing the list. Returns "" when no search is in play.
+func (m Model) renderSearchLine(width int) string {
+	if !m.search.active && !m.search.on() {
+		return ""
+	}
+	style := lipgloss.NewStyle().Foreground(theme.Sun)
+	if m.search.invalid {
+		style = theme.Danger
+	}
+	q := truncateHead(m.search.query, max(10, width-14))
+	line := style.Render("/" + q)
+	if m.search.active {
+		line += style.Render("▏")
+	}
+	switch {
+	case m.search.invalid:
+		line += theme.Danger.Render("  invalid regex")
+	case !m.search.active:
+		line += theme.Dim.Render("  [esc] clear")
+	}
+	return "  " + line
+}
+
+// emptyListMessage explains why nothing is showing, which is otherwise a
+// puzzle when a filter or a search is responsible.
+func (m Model) emptyListMessage() string {
+	switch {
+	case m.search.invalid:
+		return "that pattern doesn't compile"
+	case m.search.on() && m.filter != "":
+		return "nothing in " + m.filter.Label() + " matches /" + m.search.query
+	case m.search.on():
+		return "nothing matches /" + m.search.query
+	case len(m.suspects) > 0 && m.filter != "":
+		return "nothing in " + m.filter.Label()
+	}
+	return "no suspects yet… 🌱"
+}
+
 func (m Model) renderListPanel() string {
 	width := m.listWidth()
 	height := m.listHeight()
 
 	title := fmt.Sprintf("Suspects  (%d / %d shown)", len(m.view), len(m.suspects))
 	header := theme.PanelTitle.Render(title)
+	if line := m.renderSearchLine(width - 4); line != "" {
+		header = lipgloss.JoinVertical(lipgloss.Left, header, line)
+	}
 
 	if len(m.view) == 0 {
-		body := theme.Dim.Render("  no suspects yet… 🌱")
+		body := theme.Dim.Render("  " + m.emptyListMessage())
 		inner := lipgloss.JoinVertical(lipgloss.Left, header, body)
 		return theme.Panel.Width(width).Height(height).Render(inner)
 	}
@@ -378,8 +549,18 @@ func (m Model) renderListRow(s domain.Suspect, selected bool, innerWidth int) st
 	}
 	glyph := lipgloss.NewStyle().Foreground(categoryColor(s.Category)).Render(s.Category.Glyph())
 	size := lipgloss.NewStyle().Foreground(theme.Sun).Bold(true).Render(humanize.Bytes(uint64(s.Size)))
-	pathStr := truncatePath(s.Path, innerWidth-22)
-	row := fmt.Sprintf("%s %s  %s  %s", mark, glyph, padRight(size, 9), pathStr)
+	// One column for the two things worth knowing before opening the detail
+	// panel: that an item holds unsaved work, or that its size is small
+	// because other copies are holding the same blocks.
+	risk := " "
+	switch {
+	case s.Warning != "":
+		risk = theme.Danger.Render("⚠")
+	case s.Duplicated():
+		risk = theme.Dim.Render("⧉")
+	}
+	pathStr := truncatePath(s.Path, innerWidth-24)
+	row := fmt.Sprintf("%s %s %s  %s  %s", mark, risk, glyph, padRight(size, 9), pathStr)
 	if selected {
 		return theme.ListSelected.Width(innerWidth).Render(row)
 	}
@@ -426,24 +607,52 @@ func (m Model) renderDetailPanel() string {
 
 	lastUsed := "—"
 	if !s.LastUsed.IsZero() {
-		lastUsed = fmt.Sprintf("%s (%s ago)",
+		// humanize.Time already renders the "ago".
+		lastUsed = fmt.Sprintf("%s (%s)",
 			s.LastUsed.Format("2006-01-02"),
 			humanize.Time(s.LastUsed),
 		)
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left,
+	rows := []string{
 		"",
 		lipgloss.NewStyle().Foreground(theme.Cream).Bold(true).Render(wrapped),
 		"",
 		field("Category", s.Category.Glyph()+" "+s.Category.Label(), lipgloss.NewStyle().Foreground(categoryColor(s.Category))),
-		field("Size", humanize.Bytes(uint64(s.Size)), theme.Highlight),
-		field("Last used", lastUsed, theme.ListItem),
+		field("Frees", humanize.Bytes(uint64(s.Size)), theme.Highlight),
+	}
+	// A tree a package manager installed by cloning costs almost nothing after
+	// the first copy, and the gap between what it occupies and what deleting it
+	// gives back is the whole point.
+	if s.Shared > 0 {
+		rows = append(rows,
+			field("Occupies", humanize.Bytes(uint64(s.Size+s.Shared)), theme.ListItem),
+			field("Shared", humanize.Bytes(uint64(s.Shared))+" with other copies", theme.Dim),
+		)
+	}
+	rows = append(rows, field("Last used", lastUsed, theme.ListItem))
+	// A cache's own mtime says when it was installed. Whether the project
+	// around it is still live is the thing that decides if it should go.
+	if s.Project != "" && !s.ProjectLastUsed.IsZero() {
+		projStyle := theme.ListItem
+		if time.Since(s.ProjectLastUsed) < 7*24*time.Hour {
+			projStyle = lipgloss.NewStyle().Foreground(theme.Warning)
+		}
+		rows = append(rows,
+			field("Project", truncateHead(shortenHome(s.Project), 34), theme.ListItem),
+			field("Worked on", humanize.Time(s.ProjectLastUsed), projStyle),
+		)
+	}
+	rows = append(rows,
 		field("Regenerable", regen, regenStyle),
 		field("Marked", mark, markStyle),
 		"",
 		theme.Dim.Render(s.Reason),
 	)
+	if s.Warning != "" {
+		rows = append(rows, theme.Danger.Render("⚠  "+s.Warning))
+	}
+	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
 	inner := lipgloss.JoinVertical(lipgloss.Left, header, body)
 	return theme.Panel.BorderForeground(theme.Lavender).Width(width).Height(height).Render(inner)
 }
@@ -503,6 +712,9 @@ func (m Model) phaseBanner() string {
 		return theme.Highlight.Render(fmt.Sprintf("✿ marked %s of %s · press D to trash · R to save report",
 			humanize.Bytes(uint64(marked)), humanize.Bytes(uint64(total))))
 	case PhaseConfirm:
+		if m.applyMode == applyDelete {
+			return theme.Danger.Render("⚠ about to delete items for good — confirm with y / cancel with n")
+		}
 		return theme.Danger.Render("⚠ about to move items to the Trash — confirm with y / cancel with n")
 	case PhaseCelebration:
 		return theme.Good.Render("✿ spring is sprung!")
@@ -511,11 +723,21 @@ func (m Model) phaseBanner() string {
 }
 
 func (m Model) renderFooter(scanning bool) string {
+	// While typing a search, the only keys that do anything are the editing
+	// ones, so showing the list bindings would be a lie.
+	if m.search.active {
+		return theme.KeyHint.Render("type a regex") +
+			theme.Dim.Render(" · ") + theme.KeyHint.Render("enter") + theme.Dim.Render(" keep") +
+			theme.Dim.Render(" · ") + theme.KeyHint.Render("esc") + theme.Dim.Render(" cancel") +
+			theme.Dim.Render(" · ") + theme.KeyHint.Render("ctrl+u") + theme.Dim.Render(" clear")
+	}
+
 	var hints []string
 	if scanning {
 		hints = []string{
 			theme.KeyHint.Render("space") + theme.Dim.Render(" mark"),
-			theme.KeyHint.Render("/") + theme.Dim.Render(" filter"),
+			theme.KeyHint.Render("←/→") + theme.Dim.Render(" tabs"),
+			theme.KeyHint.Render("/") + theme.Dim.Render(" search"),
 			theme.KeyHint.Render("s") + theme.Dim.Render(" sort"),
 			theme.KeyHint.Render("esc") + theme.Dim.Render(" cancel scan"),
 			theme.KeyHint.Render("q") + theme.Dim.Render(" quit"),
@@ -524,12 +746,14 @@ func (m Model) renderFooter(scanning bool) string {
 		hints = []string{
 			theme.KeyHint.Render("space") + theme.Dim.Render(" mark"),
 			theme.KeyHint.Render("S") + theme.Dim.Render(" mark safe"),
-			theme.KeyHint.Render("/") + theme.Dim.Render(" filter"),
+			theme.KeyHint.Render("←/→") + theme.Dim.Render(" tabs"),
+			theme.KeyHint.Render("/") + theme.Dim.Render(" search"),
 			theme.KeyHint.Render("s") + theme.Dim.Render(" sort"),
+			theme.KeyHint.Render("o") + theme.Dim.Render(" options"),
 			theme.KeyHint.Render("R") + theme.Dim.Render(" save report"),
-			theme.KeyHint.Render("e") + theme.Dim.Render(" edit"),
 			theme.KeyHint.Render("r") + theme.Dim.Render(" rescan"),
 			theme.KeyHint.Render("D") + theme.Dim.Render(" trash marked"),
+			theme.KeyHint.Render("X") + theme.Dim.Render(" delete marked"),
 			theme.KeyHint.Render("q") + theme.Dim.Render(" quit"),
 		}
 	}
@@ -570,24 +794,49 @@ func (m Model) viewConfirm() string {
 			c.Glyph(), c.Label(), v.count, humanize.Bytes(uint64(v.bytes))))
 	}
 
+	things := fmt.Sprintf("%d items", count)
+	if count == 1 {
+		things = "1 item"
+	}
+
 	heading := theme.Title.Render("✿  Ready to spring-clean")
-	question := theme.Highlight.Render(fmt.Sprintf("Move %d items (%s) to the Trash?",
-		count, humanize.Bytes(uint64(marked))))
-	breakdown := lipgloss.NewStyle().Foreground(theme.Cream).Render(strings.Join(lines, "\n"))
+	question := theme.Highlight.Render(fmt.Sprintf("Move %s (%s) to the Trash?",
+		things, humanize.Bytes(uint64(marked))))
 	note := theme.Subtitle.Render("Items go to ~/.Trash (Finder \"Put Back\" preserved). You can sanity-check before emptying.")
 	hint := theme.KeyHint.Render("[y/enter] yes, sweep it · [n/esc] cancel")
+	border := theme.Sun
 
+	if m.applyMode == applyDelete {
+		heading = theme.Danger.Render("⚠  Delete, not trash")
+		question = theme.Danger.Render(fmt.Sprintf("Permanently delete %s (%s)?",
+			things, humanize.Bytes(uint64(marked))))
+		note = theme.Subtitle.Render("Straight to gone: no Trash, no Put Back, no emptying a bin of\n" +
+			"a hundred thousand files afterwards. Nothing here comes back.")
+		hint = theme.KeyHint.Render("[y/enter] I'm sure · [n/esc] cancel")
+		border = theme.Warning
+		if m.confirmStep > 0 {
+			question = theme.Danger.Render(fmt.Sprintf("Really? %s (%s), gone for good.",
+				things, humanize.Bytes(uint64(marked))))
+			hint = theme.KeyHint.Render("[y/enter] delete them · [n/esc] cancel")
+		}
+	}
+
+	breakdown := lipgloss.NewStyle().Foreground(theme.Cream).Render(strings.Join(lines, "\n"))
 	body := lipgloss.JoinVertical(lipgloss.Left,
 		heading, "", question, "", breakdown, "", note, "", hint)
-	panel := theme.Panel.BorderForeground(theme.Sun).Width(min(80, m.width-4)).Render(body)
+	panel := theme.Panel.BorderForeground(border).Width(min(80, m.width-4)).Render(body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
 }
 
 func (m Model) viewApplying() string {
+	what := "moving items to the Trash via Finder"
+	if m.applyMode == applyDelete {
+		what = "deleting items"
+	}
 	body := lipgloss.JoinVertical(lipgloss.Center,
 		theme.Title.Render("✿ sweeping…"),
 		"",
-		theme.Subtitle.Render("moving items to the Trash via Finder"),
+		theme.Subtitle.Render(what),
 		"",
 		theme.Highlight.Render(animatedSpinner(m.animTick)),
 	)
@@ -712,10 +961,18 @@ func categoryColor(c domain.Category) lipgloss.Color {
 		return theme.Mist
 	case domain.CatGitWorktree:
 		return theme.Leaf
+	case domain.CatIgnoredCruft:
+		return theme.Soil
 	}
 	return theme.Cream
 }
 
+// truncatePath shortens a path to fit, keeping as many trailing components as
+// there is room for.
+//
+// The tail is what tells two paths apart. A list of build caches is fifty rows
+// all ending in `node_modules`, and it's the directory above that says which
+// worktree each one belongs to; the leading directories they share say nothing.
 func truncatePath(p string, max int) string {
 	if max < 10 {
 		max = 10
@@ -728,16 +985,18 @@ func truncatePath(p string, max int) string {
 		return p
 	}
 	parts := strings.Split(p, string(filepath.Separator))
-	if len(parts) < 3 {
+	tail := parts[len(parts)-1]
+	if len(tail)+2 > max {
 		return "…" + p[len(p)-max+1:]
 	}
-	last := parts[len(parts)-1]
-	prefix := parts[0]
-	avail := max - len(prefix) - len(last) - 5
-	if avail < 0 {
-		return "…" + p[len(p)-max+1:]
+	for i := len(parts) - 2; i > 0; i-- {
+		grown := parts[i] + "/" + tail
+		if len(grown)+2 > max {
+			break
+		}
+		tail = grown
 	}
-	return prefix + "/…/" + last
+	return "…/" + tail
 }
 
 func wrapPath(p string, w int) string {

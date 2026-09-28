@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/0xdeafcafe/springclean/internal/catalog"
+	"github.com/0xdeafcafe/springclean/internal/disk"
 	"github.com/0xdeafcafe/springclean/internal/domain"
 	"github.com/dustin/go-humanize"
 )
@@ -38,6 +39,33 @@ type Config struct {
 	Root    string
 	Workers int
 	MinSize int64
+
+	// WorktreeAgeDays is the minimum untouched age for a linked git worktree to
+	// be flagged. Zero uses catalog.WorktreeAgeDays; negative disables the
+	// filter and reports every worktree found.
+	WorktreeAgeDays int
+
+	// IgnoredAgeDays is the minimum untouched age for gitignored cruft.
+	// Zero uses catalog.IgnoredCruftAgeDays; negative disables the filter.
+	IgnoredAgeDays int
+
+	// ScanIgnored enables asking git for ignored-but-untracked paths in each
+	// repository the walk crosses. Off by default: it costs a `git ls-files`
+	// per repo, and the curated marker list already covers the common cases.
+	ScanIgnored bool
+
+	// CacheAgeDays hides build and dependency directories belonging to a
+	// checkout somebody has worked on within this many days. Zero reports every
+	// cache found, which is the default.
+	CacheAgeDays int
+
+	// SkipDedupe charges every copy of a file in full instead of working out
+	// whether copies share their storage.
+	//
+	// Detecting that costs an open per file, and it is what keeps fifty pnpm
+	// checkouts of one lockfile from looking like fifty times the disk they
+	// actually take. Sizes stay block-accurate either way.
+	SkipDedupe bool
 }
 
 type Scanner struct {
@@ -69,8 +97,15 @@ type Scanner struct {
 	seenMu sync.Mutex
 	seen   map[string]bool
 
+	ignoredMu      sync.Mutex
+	ignoredScanned map[string]bool
+
 	skipSet map[string]bool
 	markers map[string]catalog.StopMarker
+
+	// claims records storage already counted, so a file cloned or hard linked
+	// into several suspects is only charged to the first one that finds it.
+	claims *disk.Claims
 }
 
 func New(cfg Config) *Scanner {
@@ -98,6 +133,7 @@ func New(cfg Config) *Scanner {
 		seen:    map[string]bool{},
 		skipSet: skipSet,
 		markers: catalog.StopMarkers(),
+		claims:  disk.NewClaims(!cfg.SkipDedupe),
 	}
 }
 
@@ -268,7 +304,7 @@ func (s *Scanner) markSeen(path string) bool {
 }
 
 func (s *Scanner) emit(suspect domain.Suspect) {
-	if suspect.Size < s.cfg.MinSize {
+	if suspect.Footprint() < s.cfg.MinSize {
 		return
 	}
 	s.suspMu.Lock()
@@ -306,20 +342,42 @@ func (s *Scanner) seedCurated() {
 }
 
 func (s *Scanner) walkRoot(root string) {
-	s.walkDir(root)
+	s.walkDir(root, project{})
 }
 
-func (s *Scanner) walkDir(dir string) {
+// walkDir descends `dir`, carrying the checkout it is currently inside so that
+// anything found underneath can be attributed to it.
+func (s *Scanner) walkDir(dir string, proj project) {
 	s.submit(func() {
 		s.currentPath.Store(dir)
-		if ok, _ := linkedWorktree(dir); ok {
-			s.emitWorktree(dir)
-			return
+		if ok, gitDir := linkedWorktree(dir); ok {
+			touched, emitted := s.emitWorktree(dir, gitDir)
+			if emitted {
+				// Emitted whole. Walking in would double-count everything
+				// the worktree removal already reclaims.
+				return
+			}
+			// Too recently touched to flag as abandoned. Walk it like any other
+			// directory so its caches are still found, but remember how fresh
+			// it is: its caches belong to work that's still in progress.
+			proj = project{root: dir, touched: touched}
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			s.reportErr(dir, err)
 			return
+		}
+		if hasGitEntry(entries) {
+			if s.cfg.ScanIgnored {
+				s.scanIgnored(dir)
+			}
+			// An ordinary checkout. Dating it from git's index is a stat rather
+			// than the full walk emitWorktree can afford to do.
+			if proj.root != dir {
+				if touched := gitActivity(dir); !touched.IsZero() {
+					proj = project{root: dir, touched: touched}
+				}
+			}
 		}
 		for _, e := range entries {
 			path := filepath.Join(dir, e.Name())
@@ -331,13 +389,17 @@ func (s *Scanner) walkDir(dir string) {
 
 			if e.IsDir() {
 				if marker, ok := s.markers[e.Name()]; ok {
-					s.sizeWhole(path, marker.Category, marker.Reason, marker.Regenerable)
+					if s.cacheSuppressed(proj) {
+						s.skipped.Add(1)
+						continue
+					}
+					s.sizeCache(path, marker.Category, marker.Reason, marker.Regenerable, proj)
 					continue
 				}
 				if isHiddenSkip(e.Name()) {
 					continue
 				}
-				s.walkDir(path)
+				s.walkDir(path, proj)
 				continue
 			}
 
@@ -361,32 +423,92 @@ func (s *Scanner) checkFileHeuristics(path string, info fs.FileInfo) {
 		age := time.Since(info.ModTime())
 		if age > catalog.DownloadAgeDays*24*time.Hour && sz >= 10*1024*1024 {
 			days := int(age.Hours() / 24)
-			s.emit(domain.Suspect{
+			sus := domain.Suspect{
 				ID:          domain.MakeID(path),
 				Path:        path,
-				Size:        sz,
 				Category:    domain.CatDownload,
 				Reason:      fmt.Sprintf("Download untouched for %d days", days),
 				IsDir:       false,
 				LastUsed:    info.ModTime(),
 				Regenerable: false,
-			})
+			}
+			// Only files that make it this far are measured properly: the
+			// claim costs an open, and the walk passes through every file in
+			// the tree.
+			record(&sus, s.claims.Charge(path, info))
+			s.emit(sus)
 			return
 		}
 	}
 
 	if sz >= catalog.LargeFileThreshold {
-		s.emit(domain.Suspect{
+		sus := domain.Suspect{
 			ID:          domain.MakeID(path),
 			Path:        path,
-			Size:        sz,
 			Category:    domain.CatLargeFile,
 			Reason:      fmt.Sprintf("Large file (%s)", humanize.Bytes(uint64(sz))),
 			IsDir:       false,
 			LastUsed:    info.ModTime(),
 			Regenerable: false,
-		})
+		}
+		record(&sus, s.claims.Charge(path, info))
+		s.emit(sus)
 	}
+}
+
+// cacheSuppressed reports whether a cache should be left alone because the
+// project owning it is still being worked on.
+func (s *Scanner) cacheSuppressed(proj project) bool {
+	minAge := s.cacheMinAge()
+	if minAge <= 0 || !proj.known() {
+		return false
+	}
+	return time.Since(proj.touched) < minAge
+}
+
+// cacheMinAge is how long a project must have been left alone before its
+// caches are worth offering. Zero means no filter: every cache is reported,
+// which is the behaviour when the flag isn't set.
+func (s *Scanner) cacheMinAge() time.Duration {
+	if s.cfg.CacheAgeDays <= 0 {
+		return 0
+	}
+	return time.Duration(s.cfg.CacheAgeDays) * 24 * time.Hour
+}
+
+// sizeCache emits a build or dependency directory, tagged with the checkout it
+// belongs to.
+func (s *Scanner) sizeCache(path string, cat domain.Category, reason string, regen bool, proj project) {
+	s.submit(func() {
+		if !s.markSeen(path) {
+			return
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				s.reportErr(path, err)
+			}
+			return
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		sus := domain.Suspect{
+			ID:          domain.MakeID(path),
+			Path:        path,
+			Category:    cat,
+			Reason:      reason,
+			IsDir:       true,
+			LastUsed:    info.ModTime(),
+			Regenerable: regen,
+		}
+		record(&sus, s.sumDir(path))
+		if proj.known() {
+			sus.Project = proj.root
+			sus.ProjectLastUsed = proj.touched
+		}
+		s.emit(sus)
+	})
 }
 
 func (s *Scanner) sizeWhole(path string, cat domain.Category, reason string, regen bool) {
@@ -405,24 +527,23 @@ func (s *Scanner) sizeWhole(path string, cat domain.Category, reason string, reg
 		if info.Mode()&os.ModeSymlink != 0 {
 			return
 		}
-		var size int64
+		var usage disk.Usage
 		if info.IsDir() {
-			size = s.sumDir(path)
+			usage = s.sumDir(path)
 		} else {
-			size = info.Size()
-			s.bytes.Add(size)
-			s.items.Add(1)
+			usage = s.sumFile(path, info)
 		}
-		s.emit(domain.Suspect{
+		sus := domain.Suspect{
 			ID:          domain.MakeID(path),
 			Path:        path,
-			Size:        size,
 			Category:    cat,
 			Reason:      reason,
 			IsDir:       info.IsDir(),
 			LastUsed:    info.ModTime(),
 			Regenerable: regen,
-		})
+		}
+		record(&sus, usage)
+		s.emit(sus)
 	})
 }
 
@@ -447,12 +568,28 @@ func (s *Scanner) sizeContents(path string, cat domain.Category, reason string, 
 	})
 }
 
-// sumDir walks `root` in parallel and returns the total size of regular files
-// underneath. A local semaphore caps fan-out so this can't starve the global
-// worker pool that called us. Per-directory atomic batching keeps cache
+// record puts a measurement on a suspect. Size is what deleting the item
+// frees; Apparent is what its files add up to on paper.
+func record(sus *domain.Suspect, u disk.Usage) {
+	sus.Size = u.Real
+	sus.Apparent = u.Apparent
+	sus.Shared = u.Shared
+}
+
+// sumFile measures one regular file, counting it towards the scan totals.
+func (s *Scanner) sumFile(path string, info os.FileInfo) disk.Usage {
+	u := s.claims.Charge(path, info)
+	s.bytes.Add(u.Apparent)
+	s.items.Add(1)
+	return u
+}
+
+// sumDir walks `root` in parallel and returns what the regular files
+// underneath cost. A local semaphore caps fan-out so this can't starve the
+// global worker pool that called us. Per-directory atomic batching keeps cache
 // contention low when many workers are active. Symlinks are not followed.
-func (s *Scanner) sumDir(root string) int64 {
-	var total atomic.Int64
+func (s *Scanner) sumDir(root string) disk.Usage {
+	var apparent, actual, shared atomic.Int64
 	localSem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 
@@ -473,7 +610,7 @@ func (s *Scanner) sumDir(root string) int64 {
 			}
 			return
 		}
-		var localBytes int64
+		var local disk.Usage
 		var localItems int64
 		for _, e := range entries {
 			p := filepath.Join(dir, e.Name())
@@ -489,19 +626,21 @@ func (s *Scanner) sumDir(root string) int64 {
 				go walk(p)
 				continue
 			}
-			localBytes += info.Size()
+			local.Add(s.claims.Charge(p, info))
 			localItems++
 		}
-		if localBytes > 0 || localItems > 0 {
-			total.Add(localBytes)
-			s.bytes.Add(localBytes)
+		if local.Apparent > 0 || localItems > 0 {
+			apparent.Add(local.Apparent)
+			actual.Add(local.Real)
+			shared.Add(local.Shared)
+			s.bytes.Add(local.Apparent)
 			s.items.Add(localItems)
 		}
 	}
 	wg.Add(1)
 	walk(root)
 	wg.Wait()
-	return total.Load()
+	return disk.Usage{Apparent: apparent.Load(), Real: actual.Load(), Shared: shared.Load()}
 }
 
 func isHiddenSkip(name string) bool {
@@ -516,34 +655,75 @@ func isHiddenSkip(name string) bool {
 // summing the working-tree size. Children are not walked separately — removing
 // the worktree reclaims everything inside, including its node_modules / target
 // / etc., so flagging them individually would double-count.
-func (s *Scanner) emitWorktree(dir string) {
+//
+// Age comes from the newest real source file rather than the directory mtime,
+// and git is consulted for unsaved work, so a worktree the user is mid-way
+// through is never presented as abandoned.
+// Returns when the worktree was last worked on, and whether it was emitted as
+// a single suspect. A false second value means it was too recently touched to
+// be considered abandoned and the caller should walk it normally.
+func (s *Scanner) emitWorktree(dir, gitDir string) (time.Time, bool) {
 	if !s.markSeen(dir) {
-		return
+		return time.Time{}, true
 	}
-	info, err := os.Lstat(dir)
-	if err != nil {
+	if _, err := os.Lstat(dir); err != nil {
 		if !os.IsNotExist(err) {
 			s.reportErr(dir, err)
 		}
-		return
+		return time.Time{}, true
 	}
-	size := s.sumDir(dir)
-	mtime := info.ModTime()
-	reason := "Linked git worktree (uncommitted work may be lost)"
-	if age := time.Since(mtime); age > 30*24*time.Hour {
-		days := int(age.Hours() / 24)
-		reason = fmt.Sprintf("Linked git worktree, untouched for %d days (uncommitted work may be lost)", days)
+
+	touched := contentModTime(s.ctx, dir)
+	if touched.IsZero() {
+		// Nothing datable inside, so fall back to the directory's own mtime
+		// rather than treating the worktree as infinitely old.
+		if info, err := os.Lstat(dir); err == nil {
+			touched = info.ModTime()
+		}
 	}
-	s.emit(domain.Suspect{
+
+	age := time.Since(touched)
+	if age < s.worktreeMinAge() {
+		return touched, false
+	}
+
+	usage := s.sumDir(dir)
+	git := readGitState(s.ctx, dir)
+	days := int(age.Hours() / 24)
+
+	reason := fmt.Sprintf("Linked git worktree, untouched for %d days", days)
+	if git.Branch != "" {
+		reason = fmt.Sprintf("%s (%s)", reason, git.Branch)
+	}
+
+	sus := domain.Suspect{
 		ID:          domain.MakeID(dir),
 		Path:        dir,
-		Size:        size,
 		Category:    domain.CatGitWorktree,
 		Reason:      reason,
 		IsDir:       true,
-		LastUsed:    mtime,
+		LastUsed:    touched,
 		Regenerable: false,
-	})
+		Warning:     git.Warning(),
+		GitDir:      gitDir,
+	}
+	record(&sus, usage)
+	s.emit(sus)
+	return touched, true
+}
+
+// worktreeMinAge is how long a worktree must sit untouched before it's worth
+// showing. Zero from the config means "use the catalog default"; a negative
+// value disables the filter entirely.
+func (s *Scanner) worktreeMinAge() time.Duration {
+	switch {
+	case s.cfg.WorktreeAgeDays < 0:
+		return 0
+	case s.cfg.WorktreeAgeDays == 0:
+		return catalog.WorktreeAgeDays * 24 * time.Hour
+	default:
+		return time.Duration(s.cfg.WorktreeAgeDays) * 24 * time.Hour
+	}
 }
 
 func isInDownloads(parent string) bool {

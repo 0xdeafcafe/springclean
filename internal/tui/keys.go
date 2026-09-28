@@ -13,14 +13,16 @@ type keymap struct {
 	MarkAll   key.Binding
 	UnmarkAll key.Binding
 	MarkSafe  key.Binding
-	Filter    key.Binding
+	Search    key.Binding
 	NextCat   key.Binding
 	PrevCat   key.Binding
 	Sort      key.Binding
 	Apply     key.Binding
+	Delete    key.Binding
 	Save      key.Binding
 	Edit      key.Binding
 	Rescan    key.Binding
+	Options   key.Binding
 	Help      key.Binding
 	Quit      key.Binding
 	Confirm   key.Binding
@@ -40,14 +42,16 @@ func newKeymap() keymap {
 		MarkAll:   key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "mark all visible")),
 		UnmarkAll: key.NewBinding(key.WithKeys("U"), key.WithHelp("U", "unmark all")),
 		MarkSafe:  key.NewBinding(key.WithKeys("S"), key.WithHelp("S", "mark all regenerable")),
-		Filter:    key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "cycle category")),
-		NextCat:   key.NewBinding(key.WithKeys("]"), key.WithHelp("]", "next category")),
-		PrevCat:   key.NewBinding(key.WithKeys("["), key.WithHelp("[", "prev category")),
+		Search:    key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
+		NextCat:   key.NewBinding(key.WithKeys("right", "l", "]", "tab"), key.WithHelp("→", "next tab")),
+		PrevCat:   key.NewBinding(key.WithKeys("left", "h", "["), key.WithHelp("←", "prev tab")),
 		Sort:      key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "sort")),
 		Apply:     key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "apply (trash marked)")),
+		Delete:    key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "delete marked, no trash")),
 		Save:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "save report")),
 		Edit:      key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit report in $EDITOR")),
 		Rescan:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "re-scan")),
+		Options:   key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "scan options")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 		Confirm:   key.NewBinding(key.WithKeys("y", "Y", "enter"), key.WithHelp("y/enter", "confirm")),

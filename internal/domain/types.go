@@ -3,6 +3,8 @@ package domain
 import (
 	"crypto/sha256"
 	"encoding/base32"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -21,6 +23,7 @@ const (
 	CatLargeFile    Category = "large_file"
 	CatDuplicate    Category = "duplicate"
 	CatGitWorktree  Category = "git_worktree"
+	CatIgnoredCruft Category = "ignored_cruft"
 )
 
 func (c Category) Label() string {
@@ -49,6 +52,8 @@ func (c Category) Label() string {
 		return "Duplicate"
 	case CatGitWorktree:
 		return "Git worktree"
+	case CatIgnoredCruft:
+		return "Ignored cruft"
 	}
 	return string(c)
 }
@@ -79,6 +84,8 @@ func (c Category) Glyph() string {
 		return "✧"
 	case CatGitWorktree:
 		return "❂"
+	case CatIgnoredCruft:
+		return "❉"
 	}
 	return "•"
 }
@@ -87,7 +94,7 @@ func AllCategories() []Category {
 	return []Category{
 		CatDevCache, CatAppCache, CatAppLog, CatXcode, CatPkgCache,
 		CatDocker, CatTrash, CatDownload, CatUnusedApp, CatLargeFile, CatDuplicate,
-		CatGitWorktree,
+		CatGitWorktree, CatIgnoredCruft,
 	}
 }
 
@@ -133,6 +140,72 @@ type Suspect struct {
 	LastUsed    time.Time `yaml:"last_used,omitempty"`
 	Marked      bool      `yaml:"marked"`
 	Regenerable bool      `yaml:"regenerable"`
+
+	// Warning carries a per-item safety note, such as unsaved work that would be
+	// lost. Non-empty means the item needs a look before it's marked.
+	Warning string `yaml:"warning,omitempty"`
+
+	// GitDir is the `.git/worktrees/<name>` admin directory backing a
+	// CatGitWorktree suspect. Trashing the working tree leaves this behind, so
+	// apply uses it to prune the stale registration from the owning repo.
+	GitDir string `yaml:"git_dir,omitempty"`
+
+	// Project is the checkout this item was found inside, and ProjectLastUsed
+	// is when that checkout was last worked on. A cache belonging to a project
+	// somebody touched this morning is a very different proposition to the
+	// same cache under a branch nobody has opened since spring, and the cache's
+	// own mtime says only when it was last installed.
+	Project         string    `yaml:"project,omitempty"`
+	ProjectLastUsed time.Time `yaml:"project_last_used,omitempty"`
+
+	// Apparent is the sum of the logical file sizes underneath, and Shared is
+	// the part of the real footprint that lives in blocks another suspect also
+	// references, through hard links or APFS clones.
+	//
+	// Size is what deleting this frees; Apparent is what a directory listing
+	// adds up to. They diverge wildly for anything a package manager installed
+	// by cloning: fifty pnpm checkouts of one lockfile are fifty times the
+	// apparent size and one time the real one.
+	Apparent int64 `yaml:"apparent_bytes,omitempty"`
+	Shared   int64 `yaml:"shared_bytes,omitempty"`
+}
+
+// Duplicated reports whether most of this item's bytes are storage something
+// else in the same scan also holds, which means deleting it frees far less
+// than its apparent size suggests.
+func (s Suspect) Duplicated() bool {
+	return s.Shared > 0 && s.Shared > s.Size
+}
+
+// Footprint is how much room the item takes up, as opposed to how much
+// deleting it would free. The two differ for a copy that shares its storage
+// with another one.
+//
+// Size floors are judged on this. The fiftieth clone of a node_modules frees
+// nothing on its own, but it is still a gigabyte of files, and every copy has
+// to go before any of the space comes back, so hiding all but the first would
+// leave a pile of disk unreclaimable and invisible.
+func (s Suspect) Footprint() int64 {
+	// Size and Shared are both allocated bytes, and together they are what the
+	// item occupies. Apparent can still be the larger of the two on a
+	// filesystem that compresses, so it gets a look in.
+	if alloc := s.Size + s.Shared; alloc > s.Apparent {
+		return alloc
+	}
+	return s.Apparent
+}
+
+// MainRepoFromGitDir maps a linked worktree's admin directory back to the
+// repository that owns it: `<repo>/.git/worktrees/<name>` → `<repo>`.
+// Returns "" when the path isn't shaped like a worktree admin dir.
+func MainRepoFromGitDir(gitDir string) string {
+	const sep = "/.git/worktrees/"
+	slashed := filepath.ToSlash(gitDir)
+	idx := strings.LastIndex(slashed, sep)
+	if idx < 0 {
+		return ""
+	}
+	return filepath.FromSlash(slashed[:idx])
 }
 
 func MakeID(path string) string {

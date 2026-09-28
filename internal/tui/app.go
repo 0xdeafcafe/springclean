@@ -39,6 +39,7 @@ type Phase int
 
 const (
 	PhaseSplash Phase = iota
+	PhaseOptions
 	PhaseFDA
 	PhaseScanning
 	PhaseReview
@@ -72,10 +73,13 @@ func (s sortMode) Label() string {
 }
 
 type Options struct {
-	ScanConfig    scan.Config
+	ScanConfig      scan.Config
 	StartFromReport *report.Report // if non-nil, skip scan and show this report
-	SkipSplash    bool
-	ReportPath    string // path to save reports to / load from
+	SkipSplash      bool
+	ReportPath      string // path to save reports to / load from
+	// InitialFilter pre-selects a category so a targeted invocation lands on
+	// its answer rather than on everything the scan happened to find.
+	InitialFilter domain.Category
 }
 
 type Model struct {
@@ -112,11 +116,16 @@ type Model struct {
 	applyResult trash.Result
 	applyErr    error
 	confirmStep int
+	// applyMode is what the pending confirmation will do.
+	applyMode applyMode
 
 	helpOpen bool
 	flash    string
 	flashAt  time.Time
 	err      string
+
+	form   optionsForm
+	search search
 }
 
 func New(opts Options) Model {
@@ -124,10 +133,11 @@ func New(opts Options) Model {
 		opts:     opts,
 		keys:     newKeymap(),
 		phase:    PhaseSplash,
-		filter:   "",
+		filter:   opts.InitialFilter,
 		sort:     sortBySize,
 		selected: 0,
 	}
+	m.form = newOptionsForm(opts.ScanConfig)
 	if opts.SkipSplash {
 		m.phase = PhaseScanning
 	}
@@ -143,6 +153,11 @@ func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{tickCmd()}
 	if m.opts.StartFromReport == nil {
 		cmds = append(cmds, probeFDACmd(), loadCachedCmd())
+	}
+	// SkipSplash used to set the phase to scanning without ever starting a
+	// scan, leaving the dashboard sitting at zero forever.
+	if m.opts.SkipSplash && m.opts.StartFromReport == nil {
+		cmds = append(cmds, func() tea.Msg { return autoBeginMsg{} })
 	}
 	return tea.Batch(cmds...)
 }
@@ -188,12 +203,29 @@ func (m *Model) startScan() tea.Cmd {
 	return waitForScanEvent(m.scanCh)
 }
 
-func applyCmd(paths []string, manual bool) tea.Cmd {
+// applyMode is where marked items go.
+type applyMode int
+
+const (
+	// applyTrash is the default: Finder moves the items, so Put Back works.
+	applyTrash applyMode = iota
+	// applyManualTrash writes into ~/.Trash directly, for when macOS won't
+	// let the terminal drive Finder.
+	applyManualTrash
+	// applyDelete removes them outright. Faster by a wide margin on a tree of
+	// many small files, and irreversible.
+	applyDelete
+)
+
+func applyCmd(paths []string, mode applyMode) tea.Cmd {
 	return func() tea.Msg {
 		var res trash.Result
-		if manual {
+		switch mode {
+		case applyManualTrash:
 			res = trash.MoveManyManual(paths)
-		} else {
+		case applyDelete:
+			res = trash.DeleteMany(paths)
+		default:
 			res = trash.MoveMany(paths)
 		}
 		return applyDoneMsg{result: res}
@@ -238,6 +270,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.result = msg.result
 		}
 		return m, nil
+
+	case autoBeginMsg:
+		cmd := m.startScan()
+		return m, cmd
 
 	case scanEventMsg:
 		return m.onScanEvent(msg.ev)
@@ -299,6 +335,10 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key.Matches(msg, m.keys.Quit) {
 			return m, tea.Quit
 		}
+		if msg.String() == "o" {
+			m.phase = PhaseOptions
+			return m, nil
+		}
 		if key.Matches(msg, m.keys.Begin) {
 			if !m.fda.Granted && m.fdaDone {
 				m.phase = PhaseFDA
@@ -307,6 +347,8 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			cmd := m.startScan()
 			return m, cmd
 		}
+	case PhaseOptions:
+		return m.onOptionsKey(msg)
 	case PhaseFDA:
 		if key.Matches(msg, m.keys.Quit) || key.Matches(msg, m.keys.Cancel) {
 			return m, tea.Quit
@@ -345,11 +387,11 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "r", "y", "enter":
 			paths := m.markedPaths()
 			m.phase = PhaseApplying
-			return m, applyCmd(paths, false)
+			return m, applyCmd(paths, applyTrash)
 		case "m":
 			paths := m.markedPaths()
 			m.phase = PhaseApplying
-			return m, applyCmd(paths, true)
+			return m, applyCmd(paths, applyManualTrash)
 		}
 	case PhaseCelebration:
 		if key.Matches(msg, m.keys.Quit) {
@@ -363,10 +405,104 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// onOptionsKey drives the scope/threshold form. While the path field is being
+// typed into, printable keys go to the text rather than to navigation.
+func (m Model) onOptionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.form.editing {
+		switch msg.Type {
+		case tea.KeyEnter, tea.KeyEsc:
+			m.form.editing = false
+			return m, nil
+		case tea.KeyBackspace:
+			m.form.backspacePath()
+			return m, nil
+		case tea.KeyRunes, tea.KeySpace:
+			m.form.typePath(string(msg.Runes))
+			if msg.Type == tea.KeySpace {
+				m.form.typePath(" ")
+			}
+			return m, nil
+		case tea.KeyCtrlU:
+			m.form.path = ""
+			return m, nil
+		}
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.phase = PhaseSplash
+		m.err = ""
+		return m, nil
+	case "up", "k":
+		m.form.moveCursor(-1)
+		return m, nil
+	case "down", "j", "tab":
+		m.form.moveCursor(1)
+		return m, nil
+	case "left", "h":
+		m.form.adjust(-1)
+		return m, nil
+	case "right", "l":
+		m.form.adjust(1)
+		return m, nil
+	case "e", "enter":
+		// Enter edits the path when the cursor is on it, and otherwise starts
+		// the scan, so the obvious key does the obvious thing in both places.
+		if m.form.cursor == fieldPath && m.form.pathActive() {
+			m.form.editing = true
+			m.form.scope = scopeCustom
+			return m, nil
+		}
+		if msg.String() == "enter" {
+			return m.beginFromOptions()
+		}
+		return m, nil
+	case " ":
+		return m.beginFromOptions()
+	}
+	return m, nil
+}
+
+// beginFromOptions validates the form and starts a scan with it.
+func (m Model) beginFromOptions() (tea.Model, tea.Cmd) {
+	cfg, err := m.form.config()
+	if err != nil {
+		m.err = fmt.Sprintf("%v: %s", err, m.form.path)
+		return m, nil
+	}
+	m.err = ""
+	m.opts.ScanConfig = cfg
+	if !m.fda.Granted && m.fdaDone && cfg.Mode != domain.ModeRoot {
+		m.phase = PhaseFDA
+		return m, nil
+	}
+	cmd := m.startScan()
+	return m, cmd
+}
+
 func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While the search line has focus every printable key is text, so this has
+	// to run before any of the single-letter list bindings.
+	if m.search.active {
+		return m.onSearchKey(msg)
+	}
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
+	case key.Matches(msg, m.keys.Search):
+		m.search.begin()
+		return m, nil
+	case msg.String() == "esc":
+		if m.search.on() {
+			m.search.clear()
+			m.selected, m.listTop = 0, 0
+			m.rebuildView()
+			m.setFlash("search cleared")
+		}
+		return m, nil
 	case key.Matches(msg, m.keys.Up):
 		m.moveSelection(-1)
 	case key.Matches(msg, m.keys.Down):
@@ -408,8 +544,6 @@ func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cycleFilter(1)
 	case key.Matches(msg, m.keys.PrevCat):
 		m.cycleFilter(-1)
-	case key.Matches(msg, m.keys.Filter):
-		m.cycleFilter(1)
 	case key.Matches(msg, m.keys.Sort):
 		m.sort = (m.sort + 1) % 4
 		m.rebuildView()
@@ -467,9 +601,21 @@ func (m Model) onReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.phase = PhaseConfirm
 		m.confirmStep = 0
+		m.applyMode = applyTrash
+	case key.Matches(msg, m.keys.Delete):
+		if m.markedCount() == 0 {
+			m.setFlash("nothing marked")
+			return m, nil
+		}
+		m.phase = PhaseConfirm
+		m.confirmStep = 0
+		m.applyMode = applyDelete
 	case key.Matches(msg, m.keys.Rescan):
 		cmd := m.startScan()
 		return m, cmd
+	case key.Matches(msg, m.keys.Options):
+		m.phase = PhaseOptions
+		return m, nil
 	}
 	return m, nil
 }
@@ -480,9 +626,15 @@ func (m Model) onConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if key.Matches(msg, m.keys.Confirm) {
+		// Deleting is irreversible, so it takes a second look rather than the
+		// single keypress that sending things to the Trash gets.
+		if m.applyMode == applyDelete && m.confirmStep == 0 {
+			m.confirmStep = 1
+			return m, nil
+		}
 		paths := m.markedPaths()
 		m.phase = PhaseApplying
-		return m, applyCmd(paths, false)
+		return m, applyCmd(paths, m.applyMode)
 	}
 	return m, nil
 }
@@ -540,6 +692,9 @@ func (m *Model) rebuildView() {
 	m.view = m.view[:0]
 	for i, s := range m.suspects {
 		if m.filter != "" && s.Category != m.filter {
+			continue
+		}
+		if m.search.on() && !m.search.matches(s) {
 			continue
 		}
 		m.view = append(m.view, i)
@@ -617,8 +772,60 @@ func (m *Model) toggleSelected() {
 	m.suspects[idx].Marked = !m.suspects[idx].Marked
 }
 
+// onSearchKey handles keystrokes while the `/` line has focus. The list
+// re-filters on every character, so the result is visible as it's typed.
+func (m Model) onSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		m.search.accept()
+		if m.search.invalid {
+			m.setFlash("invalid pattern")
+		}
+		return m, nil
+	case tea.KeyEsc:
+		m.search.cancel()
+	case tea.KeyBackspace:
+		m.search.backspace()
+	case tea.KeyCtrlU:
+		m.search.query = ""
+		m.search.compile()
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeySpace:
+		m.search.typeRune(" ")
+	case tea.KeyRunes:
+		m.search.typeRune(string(msg.Runes))
+	default:
+		return m, nil
+	}
+	m.selected, m.listTop = 0, 0
+	m.rebuildView()
+	return m, nil
+}
+
+// visibleCategories returns the tabs actually on screen: "all", then only the
+// categories the scan found something in. The chips and the keys that move
+// between them have to agree on this list, or the tabs step through categories
+// that aren't shown and land on an empty list.
+func (m Model) visibleCategories() []domain.Category {
+	counts := map[domain.Category]int{}
+	for _, s := range m.suspects {
+		counts[s.Category]++
+	}
+	cats := []domain.Category{""}
+	for _, c := range domain.AllCategories() {
+		if counts[c] > 0 {
+			cats = append(cats, c)
+		}
+	}
+	return cats
+}
+
 func (m *Model) cycleFilter(dir int) {
-	cats := append([]domain.Category{""}, domain.AllCategories()...)
+	cats := m.visibleCategories()
+	if len(cats) == 0 {
+		return
+	}
 	cur := 0
 	for i, c := range cats {
 		if c == m.filter {
@@ -667,4 +874,3 @@ func (m Model) markedPaths() []string {
 	}
 	return out
 }
-

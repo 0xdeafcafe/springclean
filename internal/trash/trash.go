@@ -124,6 +124,34 @@ func MoveManyManual(paths []string) Result {
 	return res
 }
 
+// DeleteMany removes paths outright, without the Trash.
+//
+// The Trash is the right default because it is reversible, but it is a bad fit
+// for a directory holding a hundred thousand small files: Finder moves them,
+// then makes you watch it delete them one by one when you empty the bin. For a
+// node_modules that is going to be reinstalled anyway, the round trip is all
+// cost and no benefit. Nothing here is recoverable, so callers must confirm
+// first.
+func DeleteMany(paths []string) Result {
+	res := Result{Failed: map[string]error{}, Method: "deleted"}
+	for _, p := range paths {
+		if _, err := os.Lstat(p); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				res.Skipped = append(res.Skipped, p)
+				continue
+			}
+			res.Failed[p] = err
+			continue
+		}
+		if err := os.RemoveAll(p); err != nil {
+			res.Failed[p] = err
+			continue
+		}
+		res.Trashed = append(res.Trashed, p)
+	}
+	return res
+}
+
 func uniqueTrashDest(trashDir, name string) string {
 	dest := filepath.Join(trashDir, name)
 	if _, err := os.Lstat(dest); err != nil {
