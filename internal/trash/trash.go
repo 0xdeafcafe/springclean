@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/0xdeafcafe/springclean/internal/simctl"
 )
 
 // ErrAutomationDenied is returned when macOS blocks osascript from sending
@@ -34,6 +36,7 @@ type Result struct {
 // can prompt the user.
 func MoveMany(paths []string) Result {
 	res := Result{Failed: map[string]error{}, Method: "finder"}
+	paths = takeSimRuntimes(paths, &res)
 	if len(paths) == 0 {
 		return res
 	}
@@ -87,6 +90,7 @@ func MoveMany(paths []string) Result {
 // as a fallback when ErrAutomationDenied is hit and the user opts in.
 func MoveManyManual(paths []string) Result {
 	res := Result{Failed: map[string]error{}, Method: "manual"}
+	paths = takeSimRuntimes(paths, &res)
 	if len(paths) == 0 {
 		return res
 	}
@@ -134,6 +138,7 @@ func MoveManyManual(paths []string) Result {
 // first.
 func DeleteMany(paths []string) Result {
 	res := Result{Failed: map[string]error{}, Method: "deleted"}
+	paths = takeSimRuntimes(paths, &res)
 	for _, p := range paths {
 		if _, err := os.Lstat(p); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -344,4 +349,15 @@ func isMissingPathErr(err error) bool {
 		}
 	}
 	return false
+}
+
+// takeSimRuntimes removes simulator runtimes through simctl, since neither
+// Finder nor rm can touch them, and returns the paths left for the caller.
+func takeSimRuntimes(paths []string, res *Result) []string {
+	deleted, failed, rest := simctl.Delete(paths)
+	res.Trashed = append(res.Trashed, deleted...)
+	for p, err := range failed {
+		res.Failed[p] = err
+	}
+	return rest
 }

@@ -113,6 +113,10 @@ func TestAdjustScopeCyclesAndMovesCursorOffHiddenRow(t *testing.T) {
 		t.Errorf("scope = %v, want to cycle back to curated", f.scope)
 	}
 	f.adjust(-1)
+	if f.scope != scopeFull {
+		t.Errorf("scope = %v, want full", f.scope)
+	}
+	f.adjust(-1)
 	if f.scope != scopeCustom {
 		t.Errorf("scope = %v, want to wrap round to custom", f.scope)
 	}

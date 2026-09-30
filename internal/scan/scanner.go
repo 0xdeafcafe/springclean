@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/0xdeafcafe/springclean/internal/catalog"
@@ -66,6 +68,10 @@ type Config struct {
 	// checkouts of one lockfile from looking like fifty times the disk they
 	// actually take. Sizes stay block-accurate either way.
 	SkipDedupe bool
+
+	// CachePath is where measured lump sizes are remembered between scans.
+	// Empty disables the cache.
+	CachePath string
 }
 
 type Scanner struct {
@@ -103,6 +109,21 @@ type Scanner struct {
 	skipSet map[string]bool
 	markers map[string]catalog.StopMarker
 
+	// tree holds the bytes found directly in each walked directory (files, plus
+	// anything sized as a lump), which the large-folder pass rolls up.
+	treeMu sync.Mutex
+	tree   map[string]int64
+
+	// io caps directory reads made while sizing lumps, across every lump at
+	// once. Each lump used to get its own cap, which added up to hundreds of
+	// threads fighting over the same filesystem locks.
+	io chan struct{}
+
+	lumps *lumpCache
+
+	// devs are the devices a walk may enter. Anything else is another mount.
+	devs map[int32]bool
+
 	// claims records storage already counted, so a file cloned or hard linked
 	// into several suspects is only charged to the first one that finds it.
 	claims *disk.Claims
@@ -110,12 +131,13 @@ type Scanner struct {
 
 func New(cfg Config) *Scanner {
 	if cfg.Workers <= 0 {
-		// FS work is IO-bound — overcommit aggressively. APFS handles
-		// concurrent metadata reads well; the OS scheduler tames any excess.
-		cfg.Workers = runtime.NumCPU() * 16
+		// Directory listing is kernel work. Measured on APFS, six workers
+		// finished as fast as eighty and every extra thread only took cores
+		// away from everything else on the machine.
+		cfg.Workers = runtime.NumCPU() / 2
 	}
-	if cfg.Workers < 32 {
-		cfg.Workers = 32
+	if cfg.Workers < 4 {
+		cfg.Workers = 4
 	}
 	if cfg.Workers > 256 {
 		cfg.Workers = 256
@@ -124,7 +146,11 @@ func New(cfg Config) *Scanner {
 		cfg.MinSize = 1 * 1024 * 1024 // 1 MB
 	}
 	skipSet := map[string]bool{}
-	for _, p := range catalog.SkipDuringHomeWalk() {
+	skips := catalog.SkipDuringHomeWalk()
+	if cfg.Mode == domain.ModeFull {
+		skips = catalog.SkipDuringFullWalk()
+	}
+	for _, p := range skips {
 		skipSet[p] = true
 	}
 	return &Scanner{
@@ -134,6 +160,10 @@ func New(cfg Config) *Scanner {
 		skipSet: skipSet,
 		markers: catalog.StopMarkers(),
 		claims:  disk.NewClaims(!cfg.SkipDedupe),
+		tree:    map[string]int64{},
+		io:      make(chan struct{}, max(2, runtime.NumCPU()/4)),
+		lumps:   openLumps(cfg.CachePath),
+		devs:    map[int32]bool{},
 	}
 }
 
@@ -160,26 +190,40 @@ func (s *Scanner) run(ctx context.Context, out chan<- Event) {
 	}()
 
 	// Seed jobs based on mode.
+	var root string
 	switch s.cfg.Mode {
 	case domain.ModeCurated:
 		s.seedCurated()
 		s.detectUnusedApps()
+		s.detectSimRuntimes()
 	case domain.ModeHome:
 		s.seedCurated()
 		s.detectUnusedApps()
-		if home, err := os.UserHomeDir(); err == nil {
-			s.walkRoot(home)
-		}
+		s.detectSimRuntimes()
+		root, _ = os.UserHomeDir()
+	case domain.ModeFull:
+		s.seedCurated()
+		s.detectUnusedApps()
+		s.detectSimRuntimes()
+		root = "/"
 	case domain.ModeRoot:
-		root := s.cfg.Root
+		root = s.cfg.Root
 		if root == "" {
 			root = "/"
 		}
+	}
+	if root != "" {
 		s.walkRoot(root)
 	}
 
 	// Wait for all work to finish.
 	s.wg.Wait()
+	if root != "" {
+		s.emitLargeDirs(root)
+		if ctx.Err() == nil {
+			_ = s.lumps.save()
+		}
+	}
 	close(stopProg)
 	<-progDone
 
@@ -342,32 +386,89 @@ func (s *Scanner) seedCurated() {
 }
 
 func (s *Scanner) walkRoot(root string) {
-	s.walkDir(root, project{})
+	// On macOS "/" is the sealed system volume and everything writable is
+	// firmlinked in from the data volume, so both count as "this disk".
+	for _, p := range []string{root, "/", "/System/Volumes/Data"} {
+		if dev, ok := deviceOf(p); ok {
+			s.devs[dev] = true
+		}
+	}
+	s.walkDir(root, disk.Entry{}, project{})
+}
+
+func deviceOf(path string) (int32, bool) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, false
+	}
+	return statDev(info)
+}
+
+func statDev(info fs.FileInfo) (int32, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int32(st.Dev), true
+}
+
+func (s *Scanner) addToTree(dir string, n int64) {
+	s.treeMu.Lock()
+	s.tree[dir] += n
+	s.treeMu.Unlock()
+}
+
+// sizeLeaf measures a directory as one lump without walking it for findings.
+// Sharing isn't worked out: that costs an open per file, which is exactly the
+// cost a lump is meant to avoid.
+func (s *Scanner) sizeLeaf(path string, e disk.Entry) {
+	s.submit(func() {
+		s.currentPath.Store(path)
+		s.addToTree(path, s.measureLump(path, e, nil).Real)
+	})
 }
 
 // walkDir descends `dir`, carrying the checkout it is currently inside so that
 // anything found underneath can be attributed to it.
-func (s *Scanner) walkDir(dir string, proj project) {
+// self is dir's own entry from its parent's listing, zero for the root.
+func (s *Scanner) walkDir(dir string, self disk.Entry, proj project) {
 	s.submit(func() {
 		s.currentPath.Store(dir)
-		if ok, gitDir := linkedWorktree(dir); ok {
-			touched, emitted := s.emitWorktree(dir, gitDir)
-			if emitted {
-				// Emitted whole. Walking in would double-count everything
-				// the worktree removal already reclaims.
-				return
-			}
-			// Too recently touched to flag as abandoned. Walk it like any other
-			// directory so its caches are still found, but remember how fresh
-			// it is: its caches belong to work that's still in progress.
-			proj = project{root: dir, touched: touched}
-		}
-		entries, err := os.ReadDir(dir)
+		entries, err := disk.ReadDir(dir)
 		if err != nil {
 			s.reportErr(dir, err)
 			return
 		}
-		if hasGitEntry(entries) {
+		git, hasGit := gitEntry(entries)
+		// Only a `.git` file can be a linked worktree, and the listing already
+		// says whether there is one, so most directories cost no extra stat.
+		if hasGit && git.Regular {
+			if ok, gitDir := linkedWorktree(dir); ok {
+				touched, emitted := s.emitWorktree(dir, self, gitDir)
+				if emitted {
+					// Emitted whole. Walking in would double-count everything
+					// the worktree removal already reclaims.
+					return
+				}
+				// Too recently touched to flag as abandoned. Walk it like any
+				// other directory so its caches are still found, but remember
+				// how fresh it is: its caches belong to work in progress.
+				proj = project{root: dir, touched: touched}
+			}
+		}
+		subdirs := 0
+		for _, e := range entries {
+			if e.IsDir {
+				subdirs++
+			}
+		}
+		if subdirs > catalog.FanoutLimit {
+			s.addToTree(dir, s.measureLump(dir, self, nil).Real)
+			return
+		}
+		s.addToTree(dir, 0)
+		markers := s.cfg.Mode != domain.ModeFull || catalog.MarkersApply(dir)
+		if markers && hasGit {
 			if s.cfg.ScanIgnored {
 				s.scanIgnored(dir)
 			}
@@ -379,48 +480,54 @@ func (s *Scanner) walkDir(dir string, proj project) {
 				}
 			}
 		}
+		var direct int64
 		for _, e := range entries {
-			path := filepath.Join(dir, e.Name())
+			path := filepath.Join(dir, e.Name)
 			if s.skipSet[path] {
 				s.skipped.Add(1)
 				continue
 			}
 			s.items.Add(1)
 
-			if e.IsDir() {
-				if marker, ok := s.markers[e.Name()]; ok {
+			if e.IsDir {
+				if !s.devs[e.Dev] {
+					s.skipped.Add(1)
+					continue
+				}
+				if marker, ok := s.markers[e.Name]; ok && markers {
 					if s.cacheSuppressed(proj) {
 						s.skipped.Add(1)
 						continue
 					}
-					s.sizeCache(path, marker.Category, marker.Reason, marker.Regenerable, proj)
+					s.sizeCache(path, e, marker.Category, marker.Reason, marker.Regenerable, proj)
 					continue
 				}
-				if isHiddenSkip(e.Name()) {
+				if isHiddenSkip(e.Name) || catalog.IsBundle(e.Name) {
+					s.sizeLeaf(path, e)
 					continue
 				}
-				s.walkDir(path, proj)
+				s.walkDir(path, e, proj)
 				continue
 			}
 
-			info, err := e.Info()
-			if err != nil {
+			if !e.Regular {
 				continue
 			}
-			sz := info.Size()
-			s.bytes.Add(sz)
+			s.bytes.Add(e.Size)
+			direct += e.Alloc
 
-			s.checkFileHeuristics(path, info)
+			s.checkFileHeuristics(path, e)
 		}
+		s.addToTree(dir, direct)
 	})
 }
 
-func (s *Scanner) checkFileHeuristics(path string, info fs.FileInfo) {
-	sz := info.Size()
+func (s *Scanner) checkFileHeuristics(path string, e disk.Entry) {
+	sz := e.Size
 	parent := filepath.Dir(path)
 
 	if isInDownloads(parent) {
-		age := time.Since(info.ModTime())
+		age := time.Since(e.ModTime)
 		if age > catalog.DownloadAgeDays*24*time.Hour && sz >= 10*1024*1024 {
 			days := int(age.Hours() / 24)
 			sus := domain.Suspect{
@@ -429,13 +536,10 @@ func (s *Scanner) checkFileHeuristics(path string, info fs.FileInfo) {
 				Category:    domain.CatDownload,
 				Reason:      fmt.Sprintf("Download untouched for %d days", days),
 				IsDir:       false,
-				LastUsed:    info.ModTime(),
+				LastUsed:    e.ModTime,
 				Regenerable: false,
 			}
-			// Only files that make it this far are measured properly: the
-			// claim costs an open, and the walk passes through every file in
-			// the tree.
-			record(&sus, s.claims.Charge(path, info))
+			record(&sus, s.claims.ChargeEntry(path, e))
 			s.emit(sus)
 			return
 		}
@@ -448,10 +552,10 @@ func (s *Scanner) checkFileHeuristics(path string, info fs.FileInfo) {
 			Category:    domain.CatLargeFile,
 			Reason:      fmt.Sprintf("Large file (%s)", humanize.Bytes(uint64(sz))),
 			IsDir:       false,
-			LastUsed:    info.ModTime(),
+			LastUsed:    e.ModTime,
 			Regenerable: false,
 		}
-		record(&sus, s.claims.Charge(path, info))
+		record(&sus, s.claims.ChargeEntry(path, e))
 		s.emit(sus)
 	}
 }
@@ -478,19 +582,9 @@ func (s *Scanner) cacheMinAge() time.Duration {
 
 // sizeCache emits a build or dependency directory, tagged with the checkout it
 // belongs to.
-func (s *Scanner) sizeCache(path string, cat domain.Category, reason string, regen bool, proj project) {
+func (s *Scanner) sizeCache(path string, e disk.Entry, cat domain.Category, reason string, regen bool, proj project) {
 	s.submit(func() {
 		if !s.markSeen(path) {
-			return
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				s.reportErr(path, err)
-			}
-			return
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
 			return
 		}
 		sus := domain.Suspect{
@@ -499,10 +593,10 @@ func (s *Scanner) sizeCache(path string, cat domain.Category, reason string, reg
 			Category:    cat,
 			Reason:      reason,
 			IsDir:       true,
-			LastUsed:    info.ModTime(),
+			LastUsed:    e.ModTime,
 			Regenerable: regen,
 		}
-		record(&sus, s.sumDir(path))
+		record(&sus, s.measureLump(path, e, s.claims))
 		if proj.known() {
 			sus.Project = proj.root
 			sus.ProjectLastUsed = proj.touched
@@ -589,44 +683,44 @@ func (s *Scanner) sumFile(path string, info os.FileInfo) disk.Usage {
 // global worker pool that called us. Per-directory atomic batching keeps cache
 // contention low when many workers are active. Symlinks are not followed.
 func (s *Scanner) sumDir(root string) disk.Usage {
+	return s.sumDirWith(root, s.claims)
+}
+
+func (s *Scanner) sumDirWith(root string, claims *disk.Claims) disk.Usage {
 	var apparent, actual, shared atomic.Int64
-	localSem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 
 	var walk func(string)
 	walk = func(dir string) {
 		defer wg.Done()
 		select {
-		case localSem <- struct{}{}:
+		case s.io <- struct{}{}:
 		case <-s.ctx.Done():
 			return
 		}
-		defer func() { <-localSem }()
-
-		entries, err := os.ReadDir(dir)
+		entries, err := disk.ReadDir(dir)
+		<-s.io
 		if err != nil {
 			if errors.Is(err, fs.ErrPermission) {
 				s.skipped.Add(1)
 			}
-			return
+			if len(entries) == 0 {
+				return
+			}
 		}
 		var local disk.Usage
 		var localItems int64
 		for _, e := range entries {
-			p := filepath.Join(dir, e.Name())
-			info, err := e.Info()
-			if err != nil {
+			if e.Symlink {
 				continue
 			}
-			if info.Mode()&os.ModeSymlink != 0 {
-				continue
-			}
-			if e.IsDir() {
+			p := filepath.Join(dir, e.Name)
+			if e.IsDir {
 				wg.Add(1)
 				go walk(p)
 				continue
 			}
-			local.Add(s.claims.Charge(p, info))
+			local.Add(claims.ChargeEntry(p, e))
 			localItems++
 		}
 		if local.Apparent > 0 || localItems > 0 {
@@ -662,7 +756,7 @@ func isHiddenSkip(name string) bool {
 // Returns when the worktree was last worked on, and whether it was emitted as
 // a single suspect. A false second value means it was too recently touched to
 // be considered abandoned and the caller should walk it normally.
-func (s *Scanner) emitWorktree(dir, gitDir string) (time.Time, bool) {
+func (s *Scanner) emitWorktree(dir string, self disk.Entry, gitDir string) (time.Time, bool) {
 	if !s.markSeen(dir) {
 		return time.Time{}, true
 	}
@@ -687,7 +781,8 @@ func (s *Scanner) emitWorktree(dir, gitDir string) (time.Time, bool) {
 		return touched, false
 	}
 
-	usage := s.sumDir(dir)
+	// The size may come from the cache; the date above never does.
+	usage := s.measureLump(dir, self, s.claims)
 	git := readGitState(s.ctx, dir)
 	days := int(age.Hours() / 24)
 
@@ -730,4 +825,94 @@ func isInDownloads(parent string) bool {
 	home, _ := os.UserHomeDir()
 	dl := filepath.Join(home, "Downloads")
 	return parent == dl || strings.HasPrefix(parent, dl+string(filepath.Separator))
+}
+
+// emitLargeDirs reports the folders holding a lot of disk that no other
+// finding accounts for.
+//
+// Sizes roll up from the deepest directory. A folder is reported when at
+// least catalog.LargeDirThreshold of it is not already explained by findings
+// or by large folders beneath it, which lands on the tightest folder that
+// actually holds the bulk: ~/.ollama/models rather than ~ or ~/.ollama.
+//
+// ponytail: sizes here are allocated blocks with no clone/hard-link dedupe, so
+// a folder full of APFS clones reads larger than deleting it frees.
+// largeDirThreshold is a var so tests can use megabytes rather than gigabytes.
+var largeDirThreshold = catalog.LargeDirThreshold
+
+func (s *Scanner) emitLargeDirs(root string) {
+	if s.ctx.Err() != nil {
+		return
+	}
+	direct := s.tree
+	covered := map[string]int64{}
+	listed := map[string]bool{}
+
+	s.suspMu.Lock()
+	found := append([]domain.Suspect(nil), s.suspList...)
+	s.suspMu.Unlock()
+	for _, sus := range found {
+		if _, ok := direct[sus.Path]; ok {
+			listed[sus.Path] = true
+			continue
+		}
+		parent := filepath.Dir(sus.Path)
+		if _, ok := direct[parent]; !ok {
+			continue
+		}
+		if sus.IsDir {
+			// Sized by its own finding rather than the walk.
+			direct[parent] += sus.Footprint()
+		}
+		covered[parent] += sus.Footprint()
+	}
+
+	dirs := make([]string, 0, len(direct))
+	for d := range direct {
+		dirs = append(dirs, d)
+	}
+	depth := func(p string) int { return strings.Count(p, string(filepath.Separator)) }
+	sort.Slice(dirs, func(i, j int) bool { return depth(dirs[i]) > depth(dirs[j]) })
+
+	total := map[string]int64{}
+	for _, d := range dirs {
+		total[d] += direct[d]
+		switch {
+		case listed[d]:
+			covered[d] = total[d]
+		case d != root && !catalog.ProtectedDir(d) && total[d]-covered[d] >= largeDirThreshold:
+			s.emitLargeDir(d, total[d], covered[d])
+			covered[d] = total[d]
+		}
+		if d == root {
+			continue
+		}
+		parent := filepath.Dir(d)
+		total[parent] += total[d]
+		covered[parent] += covered[d]
+	}
+}
+
+func (s *Scanner) emitLargeDir(path string, size, covered int64) {
+	reason := "Large folder"
+	if covered > 0 {
+		reason = fmt.Sprintf("Large folder, %s in all (%s of it listed separately)",
+			humanize.Bytes(uint64(size)), humanize.Bytes(uint64(covered)))
+	}
+	// Size is only the part no other finding lists, so totals across the
+	// report don't count the same bytes twice. Deleting the folder frees all
+	// of Apparent.
+	sus := domain.Suspect{
+		ID:       domain.MakeID(path),
+		Path:     path,
+		Category: domain.CatLargeDir,
+		Reason:   reason,
+		IsDir:    true,
+		Size:     size - covered,
+		Apparent: size,
+	}
+	if info, err := os.Lstat(path); err == nil {
+		sus.LastUsed = info.ModTime()
+	}
+	s.emit(sus)
 }

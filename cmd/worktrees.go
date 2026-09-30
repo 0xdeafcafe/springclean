@@ -41,6 +41,7 @@ func newWorktreesCmd() *cobra.Command {
 				WorktreeAgeDays: worktreeAgeFlag,
 				IgnoredAgeDays:  ignoredAgeFlag,
 				ScanIgnored:     scanIgnoredFlag,
+				CachePath:       cachePath(),
 			}
 			return runTUI(tui.Options{
 				ScanConfig: cfg,

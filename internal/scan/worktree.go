@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/0xdeafcafe/springclean/internal/catalog"
+	"github.com/0xdeafcafe/springclean/internal/disk"
 )
 
 // linkedWorktree inspects `dir` for a `.git` file (regular file, not directory)
@@ -171,19 +172,19 @@ func contentModTime(ctx context.Context, root string) time.Time {
 		if ctx.Err() != nil || depth > 24 {
 			return
 		}
-		entries, err := os.ReadDir(dir)
+		entries, err := disk.ReadDir(dir)
 		if err != nil {
 			return
 		}
 		for _, e := range entries {
-			name := e.Name()
+			name := e.Name
 			// `.git` is a directory in an ordinary checkout and a pointer file
 			// in a linked worktree. Both are git's bookkeeping, and neither
 			// says anything about when a human last worked here.
 			if name == ".git" {
 				continue
 			}
-			if e.IsDir() {
+			if e.IsDir {
 				if catalog.Regenerable(name) {
 					continue
 				}
@@ -193,12 +194,11 @@ func contentModTime(ctx context.Context, root string) time.Time {
 			if isNoiseFile(name) {
 				continue
 			}
-			info, err := e.Info()
-			if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			if e.Symlink {
 				continue
 			}
-			if mt := info.ModTime(); mt.After(newest) {
-				newest = mt
+			if e.ModTime.After(newest) {
+				newest = e.ModTime
 			}
 		}
 	}

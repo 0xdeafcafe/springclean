@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/0xdeafcafe/springclean/internal/cache"
 	"github.com/0xdeafcafe/springclean/internal/catalog"
 	"github.com/0xdeafcafe/springclean/internal/domain"
 	"github.com/0xdeafcafe/springclean/internal/scan"
@@ -27,6 +28,7 @@ var (
 	cacheAgeFlag    int
 	noDedupeFlag    bool
 	deleteFlag      bool
+	freshFlag       bool
 )
 
 func newRootCmd() *cobra.Command {
@@ -49,7 +51,7 @@ func newRootCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.PersistentFlags().StringVar(&scopeFlag, "scope", "curated", "scan scope: curated | home | root")
+	cmd.PersistentFlags().StringVar(&scopeFlag, "scope", "full", "scan scope: full | curated | home | root")
 	cmd.PersistentFlags().StringVar(&rootFlag, "root", "", "root path when --scope=root (defaults to /)")
 	cmd.PersistentFlags().StringVarP(&reportPathFlag, "report", "o", "springclean-report.yaml", "report file path")
 	cmd.PersistentFlags().BoolVarP(&yesFlag, "yes", "y", false, "skip confirmation prompts (apply)")
@@ -71,6 +73,9 @@ func newRootCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&deleteFlag, "delete", false,
 		"delete outright instead of moving to the Trash (apply) — irreversible")
 
+	cmd.PersistentFlags().BoolVar(&freshFlag, "fresh", false,
+		"re-measure everything instead of reusing sizes remembered from scans in the last day")
+
 	cmd.AddCommand(newWorktreesCmd())
 	cmd.AddCommand(newScanCmd())
 	cmd.AddCommand(newReviewCmd())
@@ -79,6 +84,8 @@ func newRootCmd() *cobra.Command {
 }
 
 func Execute() {
+	// Scans run for minutes; whatever the user is doing meanwhile comes first.
+	scan.BeNice()
 	if err := newRootCmd().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -88,7 +95,7 @@ func Execute() {
 func scanConfigFromFlags() (scan.Config, error) {
 	mode, ok := domain.ParseScanMode(scopeFlag)
 	if !ok {
-		return scan.Config{}, fmt.Errorf("invalid --scope %q (want curated|home|root)", scopeFlag)
+		return scan.Config{}, fmt.Errorf("invalid --scope %q (want full|curated|home|root)", scopeFlag)
 	}
 	cfg := scan.Config{
 		Mode:            mode,
@@ -97,6 +104,7 @@ func scanConfigFromFlags() (scan.Config, error) {
 		ScanIgnored:     scanIgnoredFlag,
 		CacheAgeDays:    cacheAgeFlag,
 		SkipDedupe:      noDedupeFlag,
+		CachePath:       cachePath(),
 	}
 
 	// --here is shorthand for pointing --scope=root at the working directory.
@@ -152,4 +160,11 @@ func runTUI(opts tui.Options) error {
 	p := tea.NewProgram(tui.New(opts), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
+}
+
+func cachePath() string {
+	if freshFlag {
+		return ""
+	}
+	return cache.LumpsPath()
 }

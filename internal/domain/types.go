@@ -11,19 +11,21 @@ import (
 type Category string
 
 const (
-	CatDevCache  Category = "dev_cache"
-	CatAppCache  Category = "app_cache"
-	CatAppLog    Category = "app_log"
-	CatXcode     Category = "xcode"
-	CatPkgCache  Category = "pkg_cache"
-	CatDocker    Category = "docker"
-	CatTrash     Category = "trash"
-	CatDownload  Category = "old_download"
-	CatUnusedApp Category = "unused_app"
+	CatDevCache     Category = "dev_cache"
+	CatAppCache     Category = "app_cache"
+	CatAppLog       Category = "app_log"
+	CatXcode        Category = "xcode"
+	CatPkgCache     Category = "pkg_cache"
+	CatDocker       Category = "docker"
+	CatTrash        Category = "trash"
+	CatDownload     Category = "old_download"
+	CatUnusedApp    Category = "unused_app"
 	CatLargeFile    Category = "large_file"
 	CatDuplicate    Category = "duplicate"
 	CatGitWorktree  Category = "git_worktree"
 	CatIgnoredCruft Category = "ignored_cruft"
+	CatLargeDir     Category = "large_dir"
+	CatSimRuntime   Category = "sim_runtime"
 )
 
 func (c Category) Label() string {
@@ -54,6 +56,10 @@ func (c Category) Label() string {
 		return "Git worktree"
 	case CatIgnoredCruft:
 		return "Ignored cruft"
+	case CatLargeDir:
+		return "Large folder"
+	case CatSimRuntime:
+		return "Simulator runtime"
 	}
 	return string(c)
 }
@@ -86,6 +92,10 @@ func (c Category) Glyph() string {
 		return "❂"
 	case CatIgnoredCruft:
 		return "❉"
+	case CatLargeDir:
+		return "❖"
+	case CatSimRuntime:
+		return "✥"
 	}
 	return "•"
 }
@@ -94,7 +104,7 @@ func AllCategories() []Category {
 	return []Category{
 		CatDevCache, CatAppCache, CatAppLog, CatXcode, CatPkgCache,
 		CatDocker, CatTrash, CatDownload, CatUnusedApp, CatLargeFile, CatDuplicate,
-		CatGitWorktree, CatIgnoredCruft,
+		CatGitWorktree, CatIgnoredCruft, CatLargeDir, CatSimRuntime,
 	}
 }
 
@@ -104,6 +114,9 @@ const (
 	ModeCurated ScanMode = iota
 	ModeHome
 	ModeRoot
+	// ModeFull is curated plus a walk of every readable directory on the
+	// machine, reporting large folders no catalog entry would name.
+	ModeFull
 )
 
 func (m ScanMode) String() string {
@@ -114,6 +127,8 @@ func (m ScanMode) String() string {
 		return "home"
 	case ModeRoot:
 		return "root"
+	case ModeFull:
+		return "full"
 	}
 	return "unknown"
 }
@@ -126,6 +141,8 @@ func ParseScanMode(s string) (ScanMode, bool) {
 		return ModeHome, true
 	case "root":
 		return ModeRoot, true
+	case "full":
+		return ModeFull, true
 	}
 	return 0, false
 }

@@ -474,6 +474,7 @@ func (m Model) beginFromOptions() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.err = ""
+	cfg.CachePath = m.opts.ScanConfig.CachePath // not a form field
 	m.opts.ScanConfig = cfg
 	if !m.fda.Granted && m.fdaDone && cfg.Mode != domain.ModeRoot {
 		m.phase = PhaseFDA

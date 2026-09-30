@@ -16,7 +16,8 @@ import (
 type scopeChoice int
 
 const (
-	scopeCurated scopeChoice = iota
+	scopeFull scopeChoice = iota
+	scopeCurated
 	scopeHome
 	scopeHere
 	scopeCustom
@@ -24,6 +25,8 @@ const (
 
 func (s scopeChoice) Label() string {
 	switch s {
+	case scopeFull:
+		return "full disk"
 	case scopeCurated:
 		return "curated"
 	case scopeHome:
@@ -38,6 +41,8 @@ func (s scopeChoice) Label() string {
 
 func (s scopeChoice) Blurb() string {
 	switch s {
+	case scopeFull:
+		return "everything readable on this mac, including large folders nothing else names."
 	case scopeCurated:
 		return "known caches and unused apps. no walk."
 	case scopeHome:
@@ -99,6 +104,8 @@ func newOptionsForm(cfg scan.Config) optionsForm {
 	f.path = cwd
 
 	switch cfg.Mode {
+	case domain.ModeFull:
+		f.scope = scopeFull
 	case domain.ModeHome:
 		f.scope = scopeHome
 	case domain.ModeRoot:
@@ -268,9 +275,11 @@ func (f optionsForm) config() (scan.Config, error) {
 		IgnoredAgeDays:  f.ignoredAge,
 		ScanIgnored:     f.ignored,
 		CacheAgeDays:    f.cacheAge,
-		SkipDedupe:    !f.realSize,
+		SkipDedupe:      !f.realSize,
 	}
 	switch f.scope {
+	case scopeFull:
+		cfg.Mode = domain.ModeFull
 	case scopeCurated:
 		cfg.Mode = domain.ModeCurated
 		// Category-specific options don't apply without a walk.

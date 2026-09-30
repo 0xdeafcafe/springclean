@@ -63,3 +63,12 @@ func Load() (domain.ScanResult, bool, error) {
 	}
 	return r, true, nil
 }
+
+// LumpsPath is where the scanner remembers directory sizes between runs.
+func LumpsPath() string {
+	dir, err := Dir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "sizes.gob")
+}

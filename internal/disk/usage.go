@@ -49,6 +49,7 @@ type shard struct {
 	mu     sync.Mutex
 	inodes map[inode]struct{}
 	blocks map[int64]struct{}
+	clones map[uint64]struct{}
 }
 
 type inode struct {
@@ -75,6 +76,7 @@ func NewClaims(extents bool) *Claims {
 	for i := range c.shard {
 		c.shard[i].inodes = map[inode]struct{}{}
 		c.shard[i].blocks = map[int64]struct{}{}
+		c.shard[i].clones = map[uint64]struct{}{}
 	}
 	return c
 }

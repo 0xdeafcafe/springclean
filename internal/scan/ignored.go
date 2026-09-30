@@ -17,20 +17,20 @@ import (
 	"github.com/dustin/go-humanize"
 )
 
-// hasGitEntry reports whether a directory listing contains `.git`, marking it
+// gitEntry finds the `.git` entry in a directory listing contains `.git`, marking it
 // as the top of a repository or linked worktree. Either way, it is the level
 // that owns a set of ignore rules.
 //
 // This takes the entries the walk has already read rather than doing its own
 // stat: the walk visits millions of directories, and an extra syscall at each
 // one is not free.
-func hasGitEntry(entries []os.DirEntry) bool {
+func gitEntry(entries []disk.Entry) (disk.Entry, bool) {
 	for _, e := range entries {
-		if e.Name() == ".git" {
-			return true
+		if e.Name == ".git" {
+			return e, true
 		}
 	}
-	return false
+	return disk.Entry{}, false
 }
 
 // listIgnored returns the paths in `repo` that git ignores, relative to the

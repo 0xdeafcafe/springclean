@@ -47,19 +47,26 @@ if you'd rather work from a yaml file:
 - **old downloads** — anything in `~/Downloads` you haven't touched in 90+ days
 - **large files** — anything >500MB lurking somewhere in `$HOME`
 - **unused apps** — `.app` bundles in `/Applications` you haven't opened in 180+ days (asks spotlight via `kMDItemLastUsedDate`)
+- **large folders** — any folder holding 1GB+ that nothing above explains: model stores, forgotten tmp dirs, old vms. sized bottom-up, so it names the tightest folder that holds the bulk, never `~` or `/Users`
+- **simulator runtimes** — the ios/watchos/tvos runtimes xcode downloads onto their own disk images, invisible to a file walk. asked of `simctl`, and removed through it too
 - **trash** — for when you forgot to empty it
 
 ## scopes
 
-three flavours:
+four flavours:
 
-- `--scope=curated` (default) — just the known caches and unused apps. fast, safe, no surprises.
+- `--scope=full` (default) — curated + walks every folder on the disk it can read. finds the big stuff no list would name. takes a few minutes on a full disk.
+- `--scope=curated` — just the known caches, unused apps and simulator runtimes. seconds, no walk.
 - `--scope=home` — curated + walks your entire `$HOME` looking for `node_modules`, worktrees, big files, etc.
 - `--scope=root --root=/some/path` — walks anywhere you point it.
 
-worktrees, large files and gitignored cruft only turn up in the two walking scopes. curated never touches the filesystem beyond the known cache paths, so pointing it at a project and expecting worktrees won't work.
+worktrees, large files, large folders and gitignored cruft only turn up in the walking scopes.
+
+the walk stays out of trouble on its own: other volumes, `/System` and autofs mounts are skipped, app bundles and photo libraries are sized as one lump, and a folder with more than 2000 subfolders (git objects, package stores) is sized without being walked into. dev-cache names like `build` or `env` only count outside `Library` and system folders. curated never touches the filesystem beyond the known cache paths, so pointing it at a project and expecting worktrees won't work.
 
 you don't have to remember any of that. press `[o]` on the splash screen for the scan options: scope, which folder, how stale a worktree has to be, whether to ask git about ignored files, whether to work out real disk use. `[o]` again from the results re-runs with different settings.
+
+the scan runs at low priority, so it uses spare cores without getting in the way of whatever else you're doing. sizes of things it measures whole (`node_modules`, app bundles, worktrees, package stores) are remembered for a day and reused while the folder is unchanged, which makes a rescan much quicker. `--fresh` measures everything again.
 
 from the shell there are shorter forms than spelling out the scope:
 

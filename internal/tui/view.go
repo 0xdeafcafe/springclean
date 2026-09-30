@@ -963,6 +963,10 @@ func categoryColor(c domain.Category) lipgloss.Color {
 		return theme.Leaf
 	case domain.CatIgnoredCruft:
 		return theme.Soil
+	case domain.CatLargeDir:
+		return theme.PetalDeep
+	case domain.CatSimRuntime:
+		return theme.Sky
 	}
 	return theme.Cream
 }
