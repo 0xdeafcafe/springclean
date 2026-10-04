@@ -382,13 +382,14 @@ func TestReadGitStateAgainstRealRepo(t *testing.T) {
 }
 
 func TestIsNoiseFile(t *testing.T) {
-	noise := []string{".DS_Store", "Thumbs.db", "build.log", "server.pid", ".tsbuildinfo"}
+	noise := []string{".DS_Store", "Thumbs.db", "build.log", "server.pid", ".tsbuildinfo",
+		".env", ".env.vault", ".env.local"}
 	for _, n := range noise {
 		if !isNoiseFile(n) {
 			t.Errorf("isNoiseFile(%q) = false, want true", n)
 		}
 	}
-	real := []string{"main.go", "README.md", "package.json", "logger.ts"}
+	real := []string{"main.go", "README.md", "package.json", "logger.ts", ".envrc", "env.ts"}
 	for _, n := range real {
 		if isNoiseFile(n) {
 			t.Errorf("isNoiseFile(%q) = true, want false", n)

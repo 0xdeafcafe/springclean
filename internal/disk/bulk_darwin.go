@@ -59,7 +59,7 @@ type attrList struct {
 
 // ReadDir lists dir with getattrlistbulk.
 func ReadDir(dir string) ([]Entry, error) {
-	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	fd, err := openDir(dir)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: dir, Err: err}
 	}

@@ -121,6 +121,9 @@ type Scanner struct {
 
 	lumps *lumpCache
 
+	// walked is the allocated size of the whole tree under the walk root.
+	walked int64
+
 	// devs are the devices a walk may enter. Anything else is another mount.
 	devs map[int32]bool
 
@@ -237,11 +240,13 @@ func (s *Scanner) run(ctx context.Context, out chan<- Event) {
 		Root:       s.cfg.Root,
 		Suspects:   append([]domain.Suspect(nil), s.suspList...),
 		Stats: domain.Stats{
-			TotalItems: s.items.Load(),
-			TotalBytes: s.bytes.Load(),
-			Skipped:    int(s.skipped.Load()),
-			Errors:     int(s.errCount.Load()),
-			Duration:   finished.Sub(s.started),
+			TotalItems:  s.items.Load(),
+			TotalBytes:  s.bytes.Load(),
+			WalkedBytes: s.walked,
+			Unreadable:  disk.TimedOut(),
+			Skipped:     int(s.skipped.Load()),
+			Errors:      int(s.errCount.Load()),
+			Duration:    finished.Sub(s.started),
 		},
 	}
 	s.suspMu.Unlock()
@@ -891,6 +896,7 @@ func (s *Scanner) emitLargeDirs(root string) {
 		total[parent] += total[d]
 		covered[parent] += covered[d]
 	}
+	s.walked = total[root]
 }
 
 func (s *Scanner) emitLargeDir(path string, size, covered int64) {

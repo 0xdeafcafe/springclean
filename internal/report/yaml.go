@@ -12,13 +12,16 @@ import (
 )
 
 type Report struct {
-	Version    int              `yaml:"version"`
-	GeneratedAt time.Time       `yaml:"generated_at"`
-	Mode       string           `yaml:"mode"`
-	Root       string           `yaml:"root,omitempty"`
-	TotalBytes int64            `yaml:"total_bytes"`
-	TotalItems int              `yaml:"total_items"`
-	Suspects   []domain.Suspect `yaml:"suspects"`
+	Version     int       `yaml:"version"`
+	GeneratedAt time.Time `yaml:"generated_at"`
+	Mode        string    `yaml:"mode"`
+	Root        string    `yaml:"root,omitempty"`
+	TotalBytes  int64     `yaml:"total_bytes"`
+	TotalItems  int       `yaml:"total_items"`
+	// WalkedBytes is everything the walk measured, listed below or not.
+	WalkedBytes int64            `yaml:"walked_bytes,omitempty"`
+	Unreadable  []string         `yaml:"unreadable,omitempty"`
+	Suspects    []domain.Suspect `yaml:"suspects"`
 }
 
 const SchemaVersion = 1
@@ -29,6 +32,8 @@ func Build(result domain.ScanResult) Report {
 		GeneratedAt: result.FinishedAt,
 		Mode:        result.Mode.String(),
 		Root:        result.Root,
+		WalkedBytes: result.Stats.WalkedBytes,
+		Unreadable:  result.Stats.Unreadable,
 		Suspects:    append([]domain.Suspect(nil), result.Suspects...),
 	}
 	sort.Slice(r.Suspects, func(i, j int) bool {
