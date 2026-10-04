@@ -80,6 +80,8 @@ func newRootCmd() *cobra.Command {
 	cmd.AddCommand(newScanCmd())
 	cmd.AddCommand(newReviewCmd())
 	cmd.AddCommand(newApplyCmd())
+	cmd.AddCommand(newSummaryCmd())
+	cmd.AddCommand(newMarkCmd())
 	return cmd
 }
 

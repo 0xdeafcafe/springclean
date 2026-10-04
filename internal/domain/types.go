@@ -252,6 +252,11 @@ type ScanProgress struct {
 type Stats struct {
 	TotalItems int64
 	TotalBytes int64
+	// WalkedBytes is the allocated size of everything the walk reached,
+	// reported or not. Zero when the scan walked no tree (curated mode).
+	WalkedBytes int64
+	// Unreadable lists folders the scan could not open and so left out.
+	Unreadable []string
 	Skipped    int
 	Errors     int
 	Duration   time.Duration

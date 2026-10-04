@@ -36,6 +36,23 @@ if you'd rather work from a yaml file:
 ./springclean apply report.yaml
 ```
 
+## without the tui
+
+for scripts and coding agents. scan once, then slice the report as often as you like:
+
+```bash
+./springclean scan --scope=full -o report.yaml
+./springclean summary report.yaml --top 40
+./springclean summary report.yaml --category git_worktree --older-than 14
+./springclean summary report.yaml --category dev_cache --json
+./springclean mark report.yaml <id-or-path>...
+./springclean apply report.yaml -y
+```
+
+`summary` prints totals per category and the largest items with what deleting each one frees, its footprint including shared storage, and how many days it has sat idle. `scan --summary` prints the same thing straight after a scan.
+
+a scan never waits on a macos privacy prompt: a folder that does not open within five seconds is skipped and listed under `unreadable` in the report.
+
 ## what it finds
 
 - **dev cache** — `node_modules`, `target`, `.next`, `.venv`, `dist`, `Pods`, you know the drill

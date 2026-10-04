@@ -256,5 +256,10 @@ func isNoiseFile(name string) bool {
 	case ".DS_Store", "Thumbs.db", ".tsbuildinfo":
 		return true
 	}
+	// Secret managers rewrite dotenv files in every checkout at once, which
+	// would make a year-old worktree look like it was edited this morning.
+	if name == ".env" || strings.HasPrefix(name, ".env.") {
+		return true
+	}
 	return strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".pid")
 }
